@@ -23,6 +23,6 @@ COPY client.py ./client.py
 # This is model download only. It does NOT control realtime client chunk size.
 RUN python scripts/download_models.py --languages en es --models-root models
 
-EXPOSE 8001
+EXPOSE 8004
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--ws-ping-interval", "20", "--ws-ping-timeout", "120"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8004", "--ws-ping-interval", "20", "--ws-ping-timeout", "120"]
