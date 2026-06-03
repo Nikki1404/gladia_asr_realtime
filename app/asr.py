@@ -6,6 +6,25 @@ import sherpa_onnx
 from app.config import MODEL_ROOT, MODEL_VARIANT, SAMPLE_RATE, SHERPA_PROVIDER
 
 
+def extract_text(result) -> str:
+    """
+    sherpa-onnx get_result() behavior differs by version.
+    Some versions return a string.
+    Some versions return an object with .text.
+    This function supports both.
+    """
+    if result is None:
+        return ""
+
+    if isinstance(result, str):
+        return result.strip()
+
+    if hasattr(result, "text"):
+        return str(result.text).strip()
+
+    return str(result).strip()
+
+
 class StreamingASR:
     """One streaming ASR session for one selected language."""
 
@@ -18,7 +37,12 @@ class StreamingASR:
         joiner = model_dir / "joiner.onnx"
         tokens = model_dir / "tokens.txt"
 
-        missing = [str(p) for p in [encoder, decoder, joiner, tokens] if not p.exists()]
+        missing = [
+            str(p)
+            for p in [encoder, decoder, joiner, tokens]
+            if not p.exists()
+        ]
+
         if missing:
             raise FileNotFoundError(
                 f"Missing model files for language='{language}'. Missing: {missing}"
@@ -49,6 +73,9 @@ class StreamingASR:
         self.last_partial = ""
 
     def accept_audio(self, audio: np.ndarray) -> Optional[str]:
+        """
+        Accept mono float32 16 kHz audio and return updated partial text.
+        """
         if audio.size == 0:
             return None
 
@@ -58,7 +85,7 @@ class StreamingASR:
             self.recognizer.decode_stream(self.stream)
 
         result = self.recognizer.get_result(self.stream)
-        text = result.text.strip()
+        text = extract_text(result)
 
         if text and text != self.last_partial:
             self.last_partial = text
@@ -67,13 +94,16 @@ class StreamingASR:
         return None
 
     def finalize(self) -> str:
+        """
+        Finish stream and return final text.
+        """
         self.stream.input_finished()
 
         while self.recognizer.is_ready(self.stream):
             self.recognizer.decode_stream(self.stream)
 
         result = self.recognizer.get_result(self.stream)
-        return result.text.strip()
+        return extract_text(result)
 
 
 class ASRManager:
