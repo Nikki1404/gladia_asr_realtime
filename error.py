@@ -1,20 +1,13 @@
-(client_env) PS C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script> python .\gladia_client.py --mode file --file C:/Users/re_nikitav/Documents/azure_benchmarking/audio/a.wav --language en --chunk-ms 30
-{'type': 'ready', 'session_id': '49515763-5eec-4e3f-acb3-0a7bc5048e6c', 'language': 'en', 'sample_rate': 16000}
-{'type': 'config_ack', 'language': 'en'}
-ERROR: 'str' object has no attribute 'text'
-
-getting this at client side 
-and this at server side 
-
-INFO:     Started server process [1]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8002 (Press CTRL+C to quit)
-INFO:     ('172.17.0.1', 42056) - "WebSocket /asr/ws" [accepted]
-Loading ASR model language=en, provider=cuda
-[49515763-5eec-4e3f-acb3-0a7bc5048e6c] connected language=en
-INFO:     connection open
-Loading ASR model language=en, provider=cuda
-[49515763-5eec-4e3f-acb3-0a7bc5048e6c] config language=en
-[49515763-5eec-4e3f-acb3-0a7bc5048e6c] ERROR: 'str' object has no attribute 'text'
-^CINFO:     Shutting down
+Model	Accuracy	Natural_Speech	Cost_per_min_USD	Latency_ms	Concurrency	Deployment	English_Support	Spanish_Support
+OpenAI Realtime	High	Medium-High	0.18-0.46	300-700	High	Managed	Yes	Yes
+Gemini Live	High	High	0.08-0.20	350-600	High	Managed	Yes	Yes
+Sesame Maya	High	Very High	N/A	400-800	Medium	Managed	Yes	Limited
+Inworld Realtime	Medium-High	High	0.05-0.15	500-800	High	Managed	Yes	Yes
+NVIDIA Riva / Nemotron	Medium-High	Medium	0.01-0.05	200-1000	Very High	Self-hosted	Yes	Yes
+Deepgram Voice Agent	Medium-High	Medium-High	0.05-0.163	<300	High	Managed / Hybrid	Yes	Yes
+Amazon Nova Sonic	Medium-High	Medium-High	0.017	1100	High	Managed	Yes	Yes
+Hume AI (EVI)	Medium-High	Very High	0.04-0.07	500-900	Medium	Managed	Yes	Yes
+ElevenLabs Conversational AI	High	Very High	0.08-0.10	300-700	High	Managed / Hybrid	Yes	Yes
+Vapi	Medium-High	High	0.10-0.33	500-900	High	Hybrid (BYO stack)	Yes	Yes
+Retell AI	Medium-High	High	0.07-0.31	500-800	High	Managed	Yes	Yes
+Kore.ai	High	Medium	N/A (session/seat-based)
