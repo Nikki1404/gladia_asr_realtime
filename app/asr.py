@@ -7,12 +7,6 @@ from app.config import MODEL_ROOT, MODEL_VARIANT, SAMPLE_RATE, SHERPA_PROVIDER
 
 
 def extract_text(result) -> str:
-    """
-    sherpa-onnx get_result() behavior differs by version.
-    Some versions return a string.
-    Some versions return an object with .text.
-    This function supports both.
-    """
     if result is None:
         return ""
 
@@ -26,8 +20,6 @@ def extract_text(result) -> str:
 
 
 class StreamingASR:
-    """One streaming ASR session for one selected language."""
-
     def __init__(self, language: str):
         self.language = language
         model_dir = MODEL_ROOT / MODEL_VARIANT / language
@@ -73,9 +65,6 @@ class StreamingASR:
         self.last_partial = ""
 
     def accept_audio(self, audio: np.ndarray) -> Optional[str]:
-        """
-        Accept mono float32 16 kHz audio and return updated partial text.
-        """
         if audio.size == 0:
             return None
 
@@ -95,8 +84,21 @@ class StreamingASR:
 
     def finalize(self) -> str:
         """
-        Finish stream and return final text.
+        Server-side final flush fix.
+        Adds trailing silence before input_finished().
         """
+
+        final_pad_ms = 1200
+        silence = np.zeros(
+            int(SAMPLE_RATE * final_pad_ms / 1000),
+            dtype=np.float32,
+        )
+
+        self.stream.accept_waveform(SAMPLE_RATE, silence)
+
+        while self.recognizer.is_ready(self.stream):
+            self.recognizer.decode_stream(self.stream)
+
         self.stream.input_finished()
 
         while self.recognizer.is_ready(self.stream):
