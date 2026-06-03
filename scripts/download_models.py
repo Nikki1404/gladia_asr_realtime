@@ -1,20 +1,30 @@
 import argparse
 import shutil
 import tarfile
-import zipfile
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 
-REPO_ID = "Banafo/Kroko-ASR"
 
-# Kroko model variant folder.
-# This is NOT client realtime streaming chunk size.
+# We keep our app folder layout:
+# models/streaming_transducers/64/en/
+# models/streaming_transducers/64/es/
 MODEL_VARIANT = "64"
 
+# Official sherpa-onnx models, not Kroko .data files.
+# These are tar.bz2 archives and contain encoder/decoder/joiner/tokens.
 MODEL_MAP = {
-    "en": "Kroko-EN-Community-64-L-Streaming-001.data",
-    "es": "Kroko-ES-Community-64-L-Streaming-001.data",
+    "en": {
+        "repo_id": "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
+        "filename": "sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
+    },
+    "es": {
+        # Spanish streaming zipformer model.
+        # If this repo/file is unavailable in your network, use --languages en first,
+        # then we can swap Spanish to another available sherpa-onnx Spanish model.
+        "repo_id": "csukuangfj/sherpa-onnx-streaming-zipformer-es-2024-01-04",
+        "filename": "sherpa-onnx-streaming-zipformer-es-2024-01-04.tar.bz2",
+    },
 }
 
 REQUIRED_FILES = ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
@@ -22,75 +32,80 @@ REQUIRED_FILES = ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
 
 def safe_extract_tar(tar: tarfile.TarFile, output_dir: Path):
     output_dir = output_dir.resolve()
+
     for member in tar.getmembers():
         member_path = (output_dir / member.name).resolve()
         if not str(member_path).startswith(str(output_dir)):
             raise RuntimeError(f"Unsafe tar path detected: {member.name}")
+
     tar.extractall(output_dir)
 
 
-def extract_archive(data_file: Path, output_dir: Path):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Extracting {data_file} -> {output_dir}", flush=True)
+def find_and_copy_required_files(extracted_dir: Path, final_dir: Path):
+    final_dir.mkdir(parents=True, exist_ok=True)
 
-    if tarfile.is_tarfile(data_file):
-        with tarfile.open(data_file, "r:*") as tar:
-            safe_extract_tar(tar, output_dir)
-        return
-
-    if zipfile.is_zipfile(data_file):
-        with zipfile.ZipFile(data_file, "r") as zf:
-            zf.extractall(output_dir)
-        return
-
-    raise RuntimeError(
-        f"Unsupported model archive format: {data_file}. Expected tar or zip-like .data archive."
-    )
-
-
-def normalize_files(output_dir: Path):
     for filename in REQUIRED_FILES:
-        target = output_dir / filename
-        if target.exists():
-            continue
+        matches = list(extracted_dir.rglob(filename))
 
-        matches = list(output_dir.rglob(filename))
         if not matches:
-            raise FileNotFoundError(f"Could not find {filename} inside {output_dir}")
+            raise FileNotFoundError(
+                f"Could not find {filename} under extracted folder: {extracted_dir}"
+            )
 
-        source = matches[0]
-        print(f"Copying {source} -> {target}", flush=True)
-        shutil.copyfile(source, target)
+        src = matches[0]
+        dst = final_dir / filename
 
-    print(f"Validated model folder: {output_dir}", flush=True)
+        print(f"Copying {src} -> {dst}", flush=True)
+        shutil.copyfile(src, dst)
+
+    print(f"Validated final model folder: {final_dir}", flush=True)
 
 
 def download_language(language: str, models_root: Path):
     if language not in MODEL_MAP:
-        raise ValueError(f"Unsupported language: {language}. Supported: {list(MODEL_MAP)}")
+        raise ValueError(
+            f"Unsupported language={language}. Supported: {list(MODEL_MAP.keys())}"
+        )
 
-    filename = MODEL_MAP[language]
-    print(f"Downloading language={language}, file={filename}", flush=True)
+    repo_id = MODEL_MAP[language]["repo_id"]
+    filename = MODEL_MAP[language]["filename"]
 
-    downloaded = hf_hub_download(
-        repo_id=REPO_ID,
+    print(f"Downloading language={language}", flush=True)
+    print(f"Repo: {repo_id}", flush=True)
+    print(f"File: {filename}", flush=True)
+
+    downloaded_path = hf_hub_download(
+        repo_id=repo_id,
         filename=filename,
         local_dir=str(models_root / "downloads"),
-        local_dir_use_symlinks=False,
     )
 
-    downloaded_path = Path(downloaded)
-    output_dir = models_root / "streaming_transducers" / MODEL_VARIANT / language
+    downloaded_path = Path(downloaded_path)
 
-    extract_archive(downloaded_path, output_dir)
-    normalize_files(output_dir)
+    extract_root = models_root / "extracted" / language
+    final_dir = models_root / "streaming_transducers" / MODEL_VARIANT / language
+
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+
+    extract_root.mkdir(parents=True, exist_ok=True)
+
+    print(f"Extracting {downloaded_path} -> {extract_root}", flush=True)
+
+    if not tarfile.is_tarfile(downloaded_path):
+        raise RuntimeError(f"Downloaded file is not a tar archive: {downloaded_path}")
+
+    with tarfile.open(downloaded_path, "r:*") as tar:
+        safe_extract_tar(tar, extract_root)
+
+    find_and_copy_required_files(extract_root, final_dir)
 
     print(f"Done language={language}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--languages", nargs="+", default=["en", "es"])
+    parser.add_argument("--languages", nargs="+", default=["en"])
     parser.add_argument("--models-root", default="models")
     args = parser.parse_args()
 
