@@ -21,10 +21,21 @@ MODEL_MAP = {
 }
 
 MODEL_FILE_PATTERNS = {
-    "encoder.onnx": ["encoder.onnx", "encoder*.onnx"],
-    "decoder.onnx": ["decoder.onnx", "decoder*.onnx"],
-    "joiner.onnx": ["joiner.onnx", "joiner*.onnx"],
-    "tokens.txt": ["tokens.txt"],
+    "encoder.onnx": [
+        "encoder.onnx",
+        "encoder*.onnx",
+    ],
+    "decoder.onnx": [
+        "decoder.onnx",
+        "decoder*.onnx",
+    ],
+    "joiner.onnx": [
+        "joiner.onnx",
+        "joiner*.onnx",
+    ],
+    "tokens.txt": [
+        "tokens.txt",
+    ],
 }
 
 
@@ -33,6 +44,7 @@ def safe_extract_tar(tar: tarfile.TarFile, output_dir: Path):
 
     for member in tar.getmembers():
         member_path = (output_dir / member.name).resolve()
+
         if not str(member_path).startswith(str(output_dir)):
             raise RuntimeError(f"Unsafe tar path detected: {member.name}")
 
@@ -45,20 +57,32 @@ def find_best_file(root: Path, patterns: list[str]) -> Path:
     for pattern in patterns:
         matches.extend(root.rglob(pattern))
 
-    matches = [m for m in matches if m.is_file()]
+    matches = [
+        m
+        for m in matches
+        if m.is_file()
+    ]
 
     if not matches:
         raise FileNotFoundError(
             f"Could not find file with patterns={patterns} under {root}"
         )
 
-    # Prefer fp32 files for GPU if both fp32 and int8 exist.
-    fp32 = [m for m in matches if ".int8." not in m.name and "int8" not in m.name]
+    fp32 = [
+        m
+        for m in matches
+        if ".int8." not in m.name and "int8" not in m.name
+    ]
+
     if fp32:
         matches = fp32
 
-    # Prefer chunk-16-left-128 if present for English zipformer model.
-    preferred = [m for m in matches if "chunk-16-left-128" in m.name]
+    preferred = [
+        m
+        for m in matches
+        if "chunk-16-left-128" in m.name
+    ]
+
     if preferred:
         return preferred[0]
 
@@ -69,8 +93,9 @@ def copy_required_files(source_root: Path, final_dir: Path):
     final_dir.mkdir(parents=True, exist_ok=True)
 
     print("Available model files:", flush=True)
+
     for p in sorted(source_root.rglob("*")):
-        if p.is_file() and (p.suffix in [".onnx", ".txt"]):
+        if p.is_file() and p.suffix in [".onnx", ".txt"]:
             print(f"  {p}", flush=True)
 
     for target_name, patterns in MODEL_FILE_PATTERNS.items():
@@ -83,7 +108,11 @@ def copy_required_files(source_root: Path, final_dir: Path):
     print(f"Validated final model folder: {final_dir}", flush=True)
 
 
-def download_tar_model(language: str, model_info: dict, models_root: Path):
+def download_tar_model(
+    language: str,
+    model_info: dict,
+    models_root: Path,
+):
     repo_id = model_info["repo_id"]
     filename = model_info["filename"]
 
@@ -120,7 +149,11 @@ def download_tar_model(language: str, model_info: dict, models_root: Path):
     print(f"Done language={language}", flush=True)
 
 
-def download_snapshot_model(language: str, model_info: dict, models_root: Path):
+def download_snapshot_model(
+    language: str,
+    model_info: dict,
+    models_root: Path,
+):
     repo_id = model_info["repo_id"]
 
     print(f"Downloading SNAPSHOT model language={language}", flush=True)
@@ -147,33 +180,60 @@ def download_snapshot_model(language: str, model_info: dict, models_root: Path):
     print(f"Done language={language}", flush=True)
 
 
-def download_language(language: str, models_root: Path):
+def download_language(
+    language: str,
+    models_root: Path,
+):
     if language not in MODEL_MAP:
         raise ValueError(
-            f"Unsupported language={language}. Supported: {list(MODEL_MAP.keys())}"
+            f"Unsupported language={language}. "
+            f"Supported: {list(MODEL_MAP.keys())}"
         )
 
     model_info = MODEL_MAP[language]
     download_type = model_info["download_type"]
 
     if download_type == "tar":
-        download_tar_model(language, model_info, models_root)
+        download_tar_model(
+            language=language,
+            model_info=model_info,
+            models_root=models_root,
+        )
+
     elif download_type == "snapshot":
-        download_snapshot_model(language, model_info, models_root)
+        download_snapshot_model(
+            language=language,
+            model_info=model_info,
+            models_root=models_root,
+        )
+
     else:
         raise ValueError(f"Unsupported download_type={download_type}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--languages", nargs="+", default=["en", "es"])
-    parser.add_argument("--models-root", default="models")
+
+    parser.add_argument(
+        "--languages",
+        nargs="+",
+        default=["en", "es"],
+    )
+
+    parser.add_argument(
+        "--models-root",
+        default="models",
+    )
+
     args = parser.parse_args()
 
     models_root = Path(args.models_root)
 
     for language in args.languages:
-        download_language(language=language, models_root=models_root)
+        download_language(
+            language=language,
+            models_root=models_root,
+        )
 
     print("All requested models downloaded successfully.", flush=True)
 
