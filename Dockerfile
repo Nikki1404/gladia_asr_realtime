@@ -33,12 +33,20 @@ COPY requirements.txt /app/requirements.txt
 
 # ------------------------------------------------------------
 # Install GPU PyTorch for CUDA 12.1
-# Do not install torch/torchaudio from requirements.txt.
 # ------------------------------------------------------------
 RUN python3 -m pip install \
     torch==2.4.0+cu121 \
     torchaudio==2.4.0+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
+
+# ------------------------------------------------------------
+# Install GPU sherpa-onnx CUDA wheel
+# IMPORTANT:
+# sherpa-onnx GPU builds are not installed from normal PyPI.
+# ------------------------------------------------------------
+RUN python3 -m pip install \
+    sherpa-onnx==1.13.2+cuda12.cudnn9 \
+    -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
 
 # ------------------------------------------------------------
 # Install remaining Python dependencies
