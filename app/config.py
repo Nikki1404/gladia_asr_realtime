@@ -11,3 +11,5 @@ MODEL_ROOT = APP_ROOT / "models" / "streaming_transducers"
 SAMPLE_RATE = 16000
 SUPPORTED_LANGUAGES = ["en", "es"]
 DEFAULT_LANGUAGE = "en"
+
+SHERPA_PROVIDER = "cuda"
