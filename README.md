@@ -9,7 +9,6 @@ Supported languages:
 
 ## Important design
 
-- Dockerfile host/port are directly inside CMD.
 - Model variant `64` is inside Python code.
 - Client realtime streaming chunk size is controlled by `--chunk-ms`.
 - File mode streams the WAV like realtime mic audio.
@@ -25,7 +24,7 @@ During build, Docker downloads EN + ES models.
 ## Run server
 
 ```bash
-docker run --rm -p 8001:8001 simple-multilingual-asr
+docker run --rm -p 8004:8004 simple-multilingual-asr
 ```
 
 Server:
