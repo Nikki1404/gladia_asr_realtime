@@ -7,32 +7,35 @@ ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-RUN apt-get update -o Acquire::Retries=5 && \
-    apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::Retries=5 && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
         python3-venv \
         ca-certificates \
         curl \
+        git \
     && rm -rf /var/lib/apt/lists/*
+
+# ── Python virtual environment ─────────────────────────────────
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 COPY requirements.txt .
 
-RUN python3 -m pip install --upgrade pip --break-system-packages && \
-    python3 -m pip install -r requirements.txt --break-system-packages
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install -r requirements.txt
 
-# CUDA-enabled sherpa-onnx
-RUN python3 -m pip install \
+# ── CUDA-enabled sherpa-onnx ───────────────────────────────────
+RUN pip install \
     sherpa-onnx==1.13.2+cuda12.cudnn9 \
-    -f https://k2-fsa.github.io/sherpa/onnx/cuda.html \
-    --break-system-packages
+    -f https://k2-fsa.github.io/sherpa/onnx/cuda.html
 
 COPY app ./app
 COPY scripts ./scripts
 COPY client.py ./client.py
 
 # Download EN + ES models during docker build
-RUN python3 scripts/download_models.py --languages en es --models-root models
+RUN python scripts/download_models.py --languages en es --models-root models
 
 EXPOSE 8002
 
