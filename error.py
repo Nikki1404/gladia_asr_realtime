@@ -1,91 +1,91 @@
-getting this 
-
-==========
-== CUDA ==
-==========
-
-CUDA Version 12.1.1
-
-Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-This container image and its contents are governed by the NVIDIA Deep Learning Container License.
-By pulling and using the container, you accept the terms and conditions of this license:
-https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
-
-A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
-
-INFO:     Started server process [1]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8002 (Press CTRL+C to quit)
-(base) root@EC03-E01-AICOE1:/home/CORP/re_nikitav/gladia_asr_realtime# docker logs d62a924c8f03
-
-==========
-== CUDA ==
-==========
-
-CUDA Version 12.1.1
-
-Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-This container image and its contents are governed by the NVIDIA Deep Learning Container License.
-By pulling and using the container, you accept the terms and conditions of this license:
-https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
-
-A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
-
-INFO:     Started server process [1]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8002 (Press CTRL+C to quit)
-INFO:     ('172.17.0.1', 39410) - "WebSocket /asr/ws" [accepted]
+INFO:     ('172.17.0.1', 57442) - "WebSocket /asr/ws" [accepted]
 Loading ASR model language=en, provider=cuda
-2026-06-03 20:49:14.667533461 [E:onnxruntime:, provider_bridge_ort.cc:2101 Create] /onnxruntime_src/onnxruntime/core/session/provider_bridge_ort.cc:1952 onnxruntime::Provider& onnxruntime::ProviderLibrary::Get() [ONNXRuntimeError] : 1 : FAIL : Failed to load library /opt/venv/lib/python3.10/site-packages/sherpa_onnx/lib/libonnxruntime_providers_cuda.so with error: libcudnn.so.9: cannot open shared object file: No such file or directory
-
-ERROR:    Exception in ASGI application
-Traceback (most recent call last):
-  File "/opt/venv/lib/python3.10/site-packages/uvicorn/protocols/websockets/websockets_impl.py", line 243, in run_asgi
-    result = await self.app(self.scope, self.asgi_receive, self.asgi_send)  # type: ignore[func-returns-value]
-  File "/opt/venv/lib/python3.10/site-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
-    return await self.app(scope, receive, send)
-  File "/opt/venv/lib/python3.10/site-packages/fastapi/applications.py", line 1054, in __call__
-    await super().__call__(scope, receive, send)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/applications.py", line 113, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/middleware/errors.py", line 152, in __call__
-    await self.app(scope, receive, send)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/middleware/exceptions.py", line 62, in __call__
-    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "/opt/venv/lib/python3.10/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/routing.py", line 715, in __call__
-    await self.middleware_stack(scope, receive, send)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/routing.py", line 735, in app
-    await route.handle(scope, receive, send)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/routing.py", line 362, in handle
-    await self.app(scope, receive, send)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/routing.py", line 95, in app
-    await wrap_app_handling_exceptions(app, session)(scope, receive, send)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
-    raise exc
-  File "/opt/venv/lib/python3.10/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
-    await app(scope, receive, sender)
-  File "/opt/venv/lib/python3.10/site-packages/starlette/routing.py", line 93, in app
-    await func(session)
-  File "/opt/venv/lib/python3.10/site-packages/fastapi/routing.py", line 383, in app
-    await dependant.call(**solved_result.values)
-  File "/app/app/main.py", line 76, in websocket_asr
-    router = MultilingualASRRouterSession(
-  File "/app/app/router.py", line 68, in __init__
-    self.asr_session: StreamingASR = self.asr_manager.create_session(
-  File "/app/app/asr.py", line 149, in create_session
-    return StreamingASR(language=language)
-  File "/app/app/asr.py", line 64, in __init__
-    self.recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
-  File "/opt/venv/lib/python3.10/site-packages/sherpa_onnx/online_recognizer.py", line 332, in from_transducer
-    self.recognizer = _Recognizer(recognizer_config)
-RuntimeError: OrtSessionOptionsAppendExecutionProvider_Cuda: Failed to load shared library
+INFO:speechbrain.utils.quirks:Applied quirks (see `speechbrain.utils.quirks`): [disable_jit_profiling, allow_tf32]
+INFO:speechbrain.utils.quirks:Excluded quirks specified by the `SB_DISABLE_QUIRKS` environment (comma-separated list): []
+INFO:speechbrain.utils.fetching:Fetch hyperparams.yaml: Fetching from HuggingFace Hub 'speechbrain/lang-id-voxlingua107-ecapa' if not cached
+INFO:speechbrain.utils.fetching:Fetch custom.py: Fetching from HuggingFace Hub 'speechbrain/lang-id-voxlingua107-ecapa' if not cached
+/usr/local/lib/python3.10/dist-packages/speechbrain/utils/autocast.py:68: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  wrapped_fwd = torch.cuda.amp.custom_fwd(fwd, cast_inputs=cast_inputs)
+INFO:speechbrain.utils.fetching:Fetch embedding_model.ckpt: Fetching from HuggingFace Hub 'speechbrain/lang-id-voxlingua107-ecapa' if not cached
+INFO:speechbrain.utils.fetching:Fetch classifier.ckpt: Fetching from HuggingFace Hub 'speechbrain/lang-id-voxlingua107-ecapa' if not cached
+INFO:speechbrain.utils.fetching:Fetch label_encoder.txt: Fetching from HuggingFace Hub 'speechbrain/lang-id-voxlingua107-ecapa' if not cached
+INFO:speechbrain.utils.parameter_transfer:Loading pretrained files for: embedding_model, classifier, label_encoder
+/usr/local/lib/python3.10/dist-packages/speechbrain/utils/checkpoints.py:200: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state_dict = torch.load(path, map_location=device)
+[b6adeba5-f78b-4022-80f7-76ac167148e4] connected language=en
 INFO:     connection open
+[b6adeba5-f78b-4022-80f7-76ac167148e4] ERROR: Cannot call "receive" once a disconnect message has been received.
 INFO:     connection closed
+
+getting this at server side 
+
+and got this at client side 
+(client_env) PS C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script> python .\gladia_client.py --mode file --file C:/Users/re_nikitav/Documents/azure_benchmarking/audio/a.wav --language en --chunk-ms 30
+Traceback (most recent call last):
+  File "C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script\client_env\Lib\site-packages\websockets\asyncio\client.py", line 546, in __await_impl__
+    await self.connection.handshake(
+    ...<2 lines>...
+    )
+  File "C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script\client_env\Lib\site-packages\websockets\asyncio\client.py", line 105, in handshake
+    await asyncio.wait(
+    ...<2 lines>...
+    )
+  File "C:\Program Files\Python313\Lib\asyncio\tasks.py", line 451, in wait
+    return await _wait(fs, timeout, return_when, loop)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\tasks.py", line 537, in _wait
+    await waiter
+asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script\client_env\Lib\site-packages\websockets\asyncio\client.py", line 542, in __await_impl__
+    async with asyncio_timeout(self.open_timeout):
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\timeouts.py", line 116, in __aexit__
+    raise TimeoutError from exc_val
+TimeoutError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script\gladia_client.py", line 273, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script\gladia_client.py", line 252, in main
+    asyncio.run(
+    ~~~~~~~~~~~^
+        run_file(
+        ^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    )
+    ^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script\gladia_client.py", line 127, in run_file
+    async with websockets.connect(
+               ~~~~~~~~~~~~~~~~~~^
+        url,
+        ^^^^
+    ...<2 lines>...
+        ping_timeout=120,
+        ^^^^^^^^^^^^^^^^^
+    ) as ws:
+    ^
+  File "C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script\client_env\Lib\site-packages\websockets\asyncio\client.py", line 590, in __aenter__
+    return await self
+           ^^^^^^^^^^
+  File "C:\Users\re_nikitav\Documents\parakeet_asr_custom_vad\script\client_env\Lib\site-packages\websockets\asyncio\client.py", line 581, in __await_impl__
+    raise TimeoutError("timed out during opening handshake") from exc
+TimeoutError: timed out during opening handshake
