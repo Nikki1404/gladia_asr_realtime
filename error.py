@@ -1,72 +1,94 @@
-
-==========
-== CUDA ==
-==========
-
-CUDA Version 12.8.1
-
-Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-This container image and its contents are governed by the NVIDIA Deep Learning Container License.
-By pulling and using the container, you accept the terms and conditions of this license:
-https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
-
-A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
-
-Traceback (most recent call last):
-  File "<frozen runpy>", line 198, in _run_module_as_main
-  File "<frozen runpy>", line 88, in _run_code
-  File "/opt/venv/lib/python3.12/site-packages/uvicorn/__main__.py", line 4, in <module>
-    uvicorn.main()
-  File "/opt/venv/lib/python3.12/site-packages/click/core.py", line 1524, in __call__
-    return self.main(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/venv/lib/python3.12/site-packages/click/core.py", line 1445, in main
-    rv = self.invoke(ctx)
-         ^^^^^^^^^^^^^^^^
-  File "/opt/venv/lib/python3.12/site-packages/click/core.py", line 1308, in invoke
-    return ctx.invoke(self.callback, **ctx.params)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/venv/lib/python3.12/site-packages/click/core.py", line 877, in invoke
-    return callback(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/venv/lib/python3.12/site-packages/uvicorn/main.py", line 412, in main
-    run(
-  File "/opt/venv/lib/python3.12/site-packages/uvicorn/main.py", line 579, in run
-    server.run()
-  File "/opt/venv/lib/python3.12/site-packages/uvicorn/server.py", line 66, in run
-    return asyncio.run(self.serve(sockets=sockets))
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run
-    return runner.run(main)
-           ^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
-  File "/opt/venv/lib/python3.12/site-packages/uvicorn/server.py", line 70, in serve
-    await self._serve(sockets)
-  File "/opt/venv/lib/python3.12/site-packages/uvicorn/server.py", line 77, in _serve
-    config.load()
-  File "/opt/venv/lib/python3.12/site-packages/uvicorn/config.py", line 435, in load
-    self.loaded_app = import_from_string(self.app)
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/venv/lib/python3.12/site-packages/uvicorn/importer.py", line 19, in import_from_string
-    module = importlib.import_module(module_str)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/importlib/__init__.py", line 90, in import_module
-    return _bootstrap._gcd_import(name[level:], package, level)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
-  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
-  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
-  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
-  File "<frozen importlib._bootstrap_external>", line 995, in exec_module
-  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
-  File "/app/app/main.py", line 8, in <module>
-    from app.asr import ASRManager
-  File "/app/app/asr.py", line 4, in <module>
-    import sherpa_onnx
-  File "/opt/venv/lib/python3.12/site-packages/sherpa_onnx/__init__.py", line 1, in <module>
-    from sherpa_onnx.lib._sherpa_onnx import (
-ImportError: libasound.so.2: cannot open shared object file: No such file or directory
+ => [11/12] COPY client.py ./client.py                                                                             0.1s
+ => ERROR [12/12] RUN python scripts/download_models.py --languages en es --models-root models                    74.7s
+------
+ > [12/12] RUN python scripts/download_models.py --languages en es --models-root models:
+0.621 Downloading TAR model language=en
+0.621 Repo: xumo/onnx_models
+0.621 File: sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2
+5.667 Extracting models/downloads/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2 -> models/extracted/en
+50.29 Available model files:
+50.29   models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx
+50.29   models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/decoder-epoch-99-avg-1-chunk-16-left-128.onnx
+50.29   models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx
+50.29   models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/encoder-epoch-99-avg-1-chunk-16-left-128.onnx
+50.29   models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx
+50.29   models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/joiner-epoch-99-avg-1-chunk-16-left-128.onnx
+50.29   models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/test_wavs/trans.txt
+50.29   models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/tokens.txt
+50.29 Copying models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/encoder-epoch-99-avg-1-chunk-16-left-128.onnx -> models/streaming_transducers/64/en/encoder.onnx
+70.03 Copying models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/decoder-epoch-99-avg-1-chunk-16-left-128.onnx -> models/streaming_transducers/64/en/decoder.onnx
+70.03 Copying models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/joiner-epoch-99-avg-1-chunk-16-left-128.onnx -> models/streaming_transducers/64/en/joiner.onnx
+70.04 Copying models/extracted/en/sherpa-onnx-streaming-zipformer-en-2023-06-26/tokens.txt -> models/streaming_transducers/64/en/tokens.txt
+70.04 Validated final model folder: models/streaming_transducers/64/en
+70.04 Done language=en
+70.04 Downloading SNAPSHOT model language=es
+70.04 Repo: csukuangfj/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]/opt/venv/lib/python3.12/site-packages/huggingface_hub/file_download.py:651: UserWarning: Not enough free disk space to download the file. The expected file size is: 154.88 MB. The target location models/snapshots/es/.cache/huggingface/download only has 26.64 MB free disk space.
+70.24   warnings.warn(
+70.24 /opt/venv/lib/python3.12/site-packages/huggingface_hub/file_download.py:651: UserWarning: Not enough free disk space to download the file. The expected file size is: 154.88 MB. The target location models/snapshots/es only has 26.64 MB free disk space.
+70.24   warnings.warn(
+Fetching 4 files:  25%|██▌       | 1/4 [00:04<00:13,  4.54s/it]
+74.61 Traceback (most recent call last):
+74.61   File "/app/scripts/download_models.py", line 182, in <module>
+74.61     main()
+74.61   File "/app/scripts/download_models.py", line 176, in main
+74.61     download_language(language=language, models_root=models_root)
+74.61   File "/app/scripts/download_models.py", line 162, in download_language
+74.62     download_snapshot_model(language, model_info, models_root)
+74.62   File "/app/scripts/download_models.py", line 129, in download_snapshot_model
+74.62     snapshot_root = snapshot_download(
+74.62                     ^^^^^^^^^^^^^^^^^^
+74.62   File "/opt/venv/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+74.62     return fn(*args, **kwargs)
+74.62            ^^^^^^^^^^^^^^^^^^^
+74.62   File "/opt/venv/lib/python3.12/site-packages/huggingface_hub/_snapshot_download.py", line 296, in snapshot_download
+74.62     thread_map(
+74.62   File "/opt/venv/lib/python3.12/site-packages/tqdm/contrib/concurrent.py", line 69, in thread_map
+74.62     return _executor_map(ThreadPoolExecutor, fn, *iterables, **tqdm_kwargs)
+74.62            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+74.62   File "/opt/venv/lib/python3.12/site-packages/tqdm/contrib/concurrent.py", line 51, in _executor_map
+74.62     return list(tqdm_class(ex.map(fn, *iterables, chunksize=chunksize), **kwargs))
+74.62            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+74.62   File "/opt/venv/lib/python3.12/site-packages/tqdm/std.py", line 1181, in __iter__
+74.62     for obj in iterable:
+74.62   File "/usr/lib/python3.12/concurrent/futures/_base.py", line 619, in result_iterator
+74.62     yield _result_or_cancel(fs.pop())
+74.62           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+74.62   File "/usr/lib/python3.12/concurrent/futures/_base.py", line 317, in _result_or_cancel
+74.62     return fut.result(timeout)
+74.62            ^^^^^^^^^^^^^^^^^^^
+74.62   File "/usr/lib/python3.12/concurrent/futures/_base.py", line 456, in result
+74.62     return self.__get_result()
+74.62            ^^^^^^^^^^^^^^^^^^^
+74.62   File "/usr/lib/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+74.62     raise self._exception
+74.62   File "/usr/lib/python3.12/concurrent/futures/thread.py", line 58, in run
+74.62     result = self.fn(*self.args, **self.kwargs)
+74.62              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+74.62   File "/opt/venv/lib/python3.12/site-packages/huggingface_hub/_snapshot_download.py", line 270, in _inner_hf_hub_download
+74.62     return hf_hub_download(
+74.62            ^^^^^^^^^^^^^^^^
+74.62   File "/opt/venv/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+74.62     return fn(*args, **kwargs)
+74.62            ^^^^^^^^^^^^^^^^^^^
+74.62   File "/opt/venv/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 840, in hf_hub_download
+74.62     return _hf_hub_download_to_local_dir(
+74.62            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+74.62   File "/opt/venv/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 1136, in _hf_hub_download_to_local_dir
+74.62     _download_to_tmp_and_move(
+74.62   File "/opt/venv/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 1543, in _download_to_tmp_and_move
+74.62     http_get(
+74.62   File "/opt/venv/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 455, in http_get
+74.62     temp_file.write(chunk)
+74.62 OSError: [Errno 28] No space left on device
+------
+Dockerfile:41
+--------------------
+  39 |
+  40 |     # Download EN + ES models during docker build
+  41 | >>> RUN python scripts/download_models.py --languages en es --models-root models
+  42 |
+  43 |     EXPOSE 8002
+--------------------
+ERROR: failed to build: failed to solve: process "/bin/sh -c python scripts/download_models.py --languages en es --models-root models" did not complete successfully: exit code: 1
+(base) root@EC03-E01-AICOE1:/home/CORP/re_nikitav/gladia_asr_realtime#
