@@ -132,7 +132,7 @@ async def run_mic(url: str, language: str, chunk_ms: int, device_index: Optional
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", default="ws://127.0.0.1:8001/asr/ws")
+    parser.add_argument("--url", default="ws://127.0.0.1:8004/asr/ws")
     parser.add_argument("--mode", choices=["file", "mic"], default="file")
     parser.add_argument("--file", help="Path to PCM16 WAV file for file mode")
     parser.add_argument("--language", choices=["en", "es"], default="en")
