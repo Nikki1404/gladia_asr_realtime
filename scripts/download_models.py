@@ -12,12 +12,15 @@ MODEL_MAP = {
     "en": {
         "repo_id": "xumo/onnx_models",
         "filename": "sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
-    },
-    # Keep ES disabled until EN build is confirmed.
-    # Your previous ES/Kroko path is the issue.
+    }
 }
 
-REQUIRED_FILES = ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
+MODEL_FILE_PATTERNS = {
+    "encoder.onnx": ["encoder*.onnx"],
+    "decoder.onnx": ["decoder*.onnx"],
+    "joiner.onnx": ["joiner*.onnx"],
+    "tokens.txt": ["tokens.txt"],
+}
 
 
 def safe_extract_tar(tar: tarfile.TarFile, output_dir: Path):
@@ -31,19 +34,43 @@ def safe_extract_tar(tar: tarfile.TarFile, output_dir: Path):
     tar.extractall(output_dir)
 
 
-def find_and_copy_required_files(extracted_dir: Path, final_dir: Path):
+def find_best_file(root: Path, patterns: list[str]) -> Path:
+    matches = []
+
+    for pattern in patterns:
+        matches.extend(root.rglob(pattern))
+
+    matches = [m for m in matches if m.is_file()]
+
+    if not matches:
+        raise FileNotFoundError(
+            f"Could not find model file with patterns={patterns} under {root}"
+        )
+
+    # Prefer fp32 over int8 for GPU unless you explicitly want int8.
+    fp32 = [m for m in matches if ".int8." not in m.name]
+    if fp32:
+        matches = fp32
+
+    # Prefer chunk-16-left-128 if available for this model.
+    preferred = [m for m in matches if "chunk-16-left-128" in m.name]
+    if preferred:
+        return preferred[0]
+
+    return matches[0]
+
+
+def copy_required_files(extract_root: Path, final_dir: Path):
     final_dir.mkdir(parents=True, exist_ok=True)
 
-    for filename in REQUIRED_FILES:
-        matches = list(extracted_dir.rglob(filename))
+    print("Extracted files found:", flush=True)
+    for p in sorted(extract_root.rglob("*")):
+        if p.is_file() and (p.suffix in [".onnx", ".txt"]):
+            print(f"  {p}", flush=True)
 
-        if not matches:
-            raise FileNotFoundError(
-                f"Could not find {filename} under {extracted_dir}"
-            )
-
-        src = matches[0]
-        dst = final_dir / filename
+    for target_name, patterns in MODEL_FILE_PATTERNS.items():
+        src = find_best_file(extract_root, patterns)
+        dst = final_dir / target_name
 
         print(f"Copying {src} -> {dst}", flush=True)
         shutil.copyfile(src, dst)
@@ -88,7 +115,7 @@ def download_language(language: str, models_root: Path):
     with tarfile.open(downloaded_path, "r:*") as tar:
         safe_extract_tar(tar, extract_root)
 
-    find_and_copy_required_files(extract_root, final_dir)
+    copy_required_files(extract_root, final_dir)
 
     print(f"Done language={language}", flush=True)
 
