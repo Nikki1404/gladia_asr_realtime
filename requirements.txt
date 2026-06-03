@@ -5,3 +5,5 @@ numpy==1.26.4
 scipy==1.14.1
 huggingface_hub==0.27.1
 hf_xet==1.1.5
+silero-vad==5.1.2
+speechbrain==1.0.2
