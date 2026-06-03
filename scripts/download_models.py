@@ -6,25 +6,15 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 
-# We keep our app folder layout:
-# models/streaming_transducers/64/en/
-# models/streaming_transducers/64/es/
 MODEL_VARIANT = "64"
 
-# Official sherpa-onnx models, not Kroko .data files.
-# These are tar.bz2 archives and contain encoder/decoder/joiner/tokens.
 MODEL_MAP = {
     "en": {
-        "repo_id": "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
+        "repo_id": "xumo/onnx_models",
         "filename": "sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
     },
-    "es": {
-        # Spanish streaming zipformer model.
-        # If this repo/file is unavailable in your network, use --languages en first,
-        # then we can swap Spanish to another available sherpa-onnx Spanish model.
-        "repo_id": "csukuangfj/sherpa-onnx-streaming-zipformer-es-2024-01-04",
-        "filename": "sherpa-onnx-streaming-zipformer-es-2024-01-04.tar.bz2",
-    },
+    # Keep ES disabled until EN build is confirmed.
+    # Your previous ES/Kroko path is the issue.
 }
 
 REQUIRED_FILES = ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
@@ -49,7 +39,7 @@ def find_and_copy_required_files(extracted_dir: Path, final_dir: Path):
 
         if not matches:
             raise FileNotFoundError(
-                f"Could not find {filename} under extracted folder: {extracted_dir}"
+                f"Could not find {filename} under {extracted_dir}"
             )
 
         src = matches[0]
@@ -64,7 +54,7 @@ def find_and_copy_required_files(extracted_dir: Path, final_dir: Path):
 def download_language(language: str, models_root: Path):
     if language not in MODEL_MAP:
         raise ValueError(
-            f"Unsupported language={language}. Supported: {list(MODEL_MAP.keys())}"
+            f"Unsupported language={language}. Supported now: {list(MODEL_MAP.keys())}"
         )
 
     repo_id = MODEL_MAP[language]["repo_id"]
@@ -93,7 +83,7 @@ def download_language(language: str, models_root: Path):
     print(f"Extracting {downloaded_path} -> {extract_root}", flush=True)
 
     if not tarfile.is_tarfile(downloaded_path):
-        raise RuntimeError(f"Downloaded file is not a tar archive: {downloaded_path}")
+        raise RuntimeError(f"Downloaded file is not tar archive: {downloaded_path}")
 
     with tarfile.open(downloaded_path, "r:*") as tar:
         safe_extract_tar(tar, extract_root)
