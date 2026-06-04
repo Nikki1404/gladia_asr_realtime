@@ -1,5 +1,4 @@
 import json
-import time
 import uuid
 from typing import Optional
 
@@ -69,14 +68,16 @@ def router_output_to_payload(output: RouterOutput, session_id: str) -> dict:
     if output.elapsed_ms is not None:
         payload["elapsed_ms"] = round(output.elapsed_ms, 2)
 
+    if output.utterance_ttfb_ms is not None:
+        payload["utterance_ttfb_ms"] = round(output.utterance_ttfb_ms, 2)
+
+    if output.utterance_ttft_ms is not None:
+        payload["utterance_ttft_ms"] = round(output.utterance_ttft_ms, 2)
+
     return payload
 
 
 def create_router(session_id: str, language: str) -> MultilingualASRRouterSession:
-    """
-    Create router lazily only after WebSocket handshake is done.
-    This prevents client handshake timeout during heavy model loading.
-    """
     print(f"[{session_id}] loading router language={language}", flush=True)
 
     router = MultilingualASRRouterSession(
@@ -94,11 +95,7 @@ async def websocket_asr(websocket: WebSocket):
 
     session_id = str(uuid.uuid4())
     language = DEFAULT_LANGUAGE
-
     router: Optional[MultilingualASRRouterSession] = None
-
-    start_time = time.time()
-    first_partial_time: Optional[float] = None
 
     print(f"[{session_id}] connected language={language}", flush=True)
 
@@ -156,8 +153,6 @@ async def websocket_asr(websocket: WebSocket):
                         continue
 
                     language = requested_language
-                    start_time = time.time()
-                    first_partial_time = None
 
                     print(f"[{session_id}] config language={language}", flush=True)
 
@@ -196,9 +191,7 @@ async def websocket_asr(websocket: WebSocket):
                                     "text": "",
                                     "ttfb_ms": None,
                                     "ttft_ms": None,
-                                    "elapsed_ms": round(
-                                        (time.time() - start_time) * 1000, 2
-                                    ),
+                                    "elapsed_ms": None,
                                     "asr_confidence": None,
                                     "stream_end": True,
                                 }
@@ -285,55 +278,43 @@ async def websocket_asr(websocket: WebSocket):
                     )
 
                     if output.type == "partial":
-                        now = time.time()
-
-                        if first_partial_time is None:
-                            first_partial_time = now
-
-                        # Keep compatibility with your earlier logging.
-                        # Router already computes TTFB/TTFT from router start.
-                        # Here we compute from config time for benchmark readability.
-                        ttfb_ms = round((first_partial_time - start_time) * 1000, 2)
-                        elapsed_ms = round((now - start_time) * 1000, 2)
-
-                        payload["ttfb_ms"] = ttfb_ms
-                        payload["ttft_ms"] = ttfb_ms
-                        payload["elapsed_ms"] = elapsed_ms
-
                         print(
                             f"[{session_id}] PARTIAL [{output.language}] "
-                            f"ttfb={payload.get('ttfb_ms')}ms "
-                            f"ttft={payload.get('ttft_ms')}ms "
-                            f"conf={payload.get('asr_confidence')} : {output.text}",
+                            f"session_ttfb={payload.get('ttfb_ms')}ms "
+                            f"session_ttft={payload.get('ttft_ms')}ms "
+                            f"utterance_ttfb={payload.get('utterance_ttfb_ms')}ms "
+                            f"utterance_ttft={payload.get('utterance_ttft_ms')}ms "
+                            f"elapsed={payload.get('elapsed_ms')}ms "
+                            f"asr_conf={payload.get('asr_confidence')} : {output.text}",
                             flush=True,
                         )
-
-                        await websocket.send_text(json.dumps(payload))
 
                     elif output.type == "language_switch":
                         print(
                             f"[{session_id}] LANGUAGE_SWITCH "
                             f"{output.language} -> {output.detected_language} "
-                            f"ttfb={payload.get('ttfb_ms')}ms "
-                            f"ttft={payload.get('ttft_ms')}ms "
+                            f"session_ttfb={payload.get('ttfb_ms')}ms "
+                            f"session_ttft={payload.get('ttft_ms')}ms "
+                            f"elapsed={payload.get('elapsed_ms')}ms "
                             f"lid_conf={payload.get('lid_confidence')} "
-                            f"label={payload.get('lid_label')}",
+                            f"lid_label={payload.get('lid_label')}",
                             flush=True,
                         )
-
-                        await websocket.send_text(json.dumps(payload))
 
                     elif output.type == "utterance_final":
                         print(
                             f"[{session_id}] UTTERANCE_FINAL [{output.language}] "
-                            f"ttfb={payload.get('ttfb_ms')}ms "
-                            f"ttft={payload.get('ttft_ms')}ms "
+                            f"session_ttfb={payload.get('ttfb_ms')}ms "
+                            f"session_ttft={payload.get('ttft_ms')}ms "
+                            f"utterance_ttfb={payload.get('utterance_ttfb_ms')}ms "
+                            f"utterance_ttft={payload.get('utterance_ttft_ms')}ms "
+                            f"elapsed={payload.get('elapsed_ms')}ms "
                             f"lid_conf={payload.get('lid_confidence')} "
                             f"lid_label={payload.get('lid_label')} : {output.text}",
                             flush=True,
                         )
 
-                        await websocket.send_text(json.dumps(payload))
+                    await websocket.send_text(json.dumps(payload))
 
     except WebSocketDisconnect:
         print(f"[{session_id}] disconnected", flush=True)
@@ -343,7 +324,6 @@ async def websocket_asr(websocket: WebSocket):
             print(f"[{session_id}] disconnected cleanly", flush=True)
         else:
             print(f"[{session_id}] RUNTIME ERROR: {exc}", flush=True)
-
             try:
                 await websocket.send_text(
                     json.dumps(
@@ -359,7 +339,6 @@ async def websocket_asr(websocket: WebSocket):
 
     except Exception as exc:
         print(f"[{session_id}] ERROR: {exc}", flush=True)
-
         try:
             await websocket.send_text(
                 json.dumps(
@@ -375,3 +354,8 @@ async def websocket_asr(websocket: WebSocket):
 
     finally:
         print(f"[{session_id}] websocket closed", flush=True)
+
+
+@app.websocket("/asr/ml/ws")
+async def websocket_asr_ml(websocket: WebSocket):
+    await websocket_asr(websocket)
