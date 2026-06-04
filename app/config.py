@@ -29,8 +29,8 @@ VAD_MAX_UTTERANCE_SEC = 25.0
 # SpeechBrain LID settings
 LID_MODEL_ID = "speechbrain/lang-id-voxlingua107-ecapa"
 LID_DEVICE = "cuda" if SHERPA_PROVIDER == "cuda" else "cpu"
-LID_MIN_AUDIO_MS = 800
-LID_CONFIDENCE_THRESHOLD = 0.55
+LID_MIN_AUDIO_MS = 500
+LID_CONFIDENCE_THRESHOLD = 0.45
 
 # Map SpeechBrain labels to local ASR model folder names.
 LID_LANGUAGE_ALIASES = {
