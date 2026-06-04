@@ -23,22 +23,25 @@ class RouterOutput:
     type: str
     text: str = ""
     language: str = ""
+
     detected_language: Optional[str] = None
     lid_confidence: Optional[float] = None
     lid_label: Optional[str] = None
 
-    # First-event session metrics.
+    # Session-level metrics
+    # TTFB = first server response/ack after first audio chunk
+    # TTFT = first non-empty ASR transcript text
     ttfb_ms: Optional[float] = None
     ttft_ms: Optional[float] = None
 
-    # Current event elapsed time.
+    # Current event elapsed time since router/session start
     elapsed_ms: Optional[float] = None
 
-    # Per-utterance first text latency.
+    # Utterance-level metrics
     utterance_ttfb_ms: Optional[float] = None
     utterance_ttft_ms: Optional[float] = None
 
-    # sherpa-onnx greedy transducer does not expose ASR word confidence.
+    # sherpa-onnx greedy transducer does not expose word confidence
     asr_confidence: Optional[float] = None
 
 
@@ -70,13 +73,14 @@ class MultilingualASRRouterSession:
 
         self.started_at = time.perf_counter()
 
-        # Session-level first response / first text.
+        # Session-level timing
+        self.first_audio_received_at: Optional[float] = None
         self.first_server_response_at: Optional[float] = None
         self.first_text_at: Optional[float] = None
 
-        # Utterance-level first response / first text.
+        # Utterance-level timing
         self.utterance_started_at: Optional[float] = None
-        self.utterance_first_response_at: Optional[float] = None
+        self.utterance_first_server_response_at: Optional[float] = None
         self.utterance_first_text_at: Optional[float] = None
 
         self.full_transcript_parts: list[str] = []
@@ -85,6 +89,9 @@ class MultilingualASRRouterSession:
         self.total_audio_samples = 0
 
         self.in_utterance = False
+
+    def _elapsed_ms(self) -> float:
+        return (time.perf_counter() - self.started_at) * 1000
 
     def _session_ttfb_ms(self) -> Optional[float]:
         if self.first_server_response_at is None:
@@ -99,9 +106,11 @@ class MultilingualASRRouterSession:
     def _utterance_ttfb_ms(self) -> Optional[float]:
         if self.utterance_started_at is None:
             return None
-        if self.utterance_first_response_at is None:
+        if self.utterance_first_server_response_at is None:
             return None
-        return (self.utterance_first_response_at - self.utterance_started_at) * 1000
+        return (
+            self.utterance_first_server_response_at - self.utterance_started_at
+        ) * 1000
 
     def _utterance_ttft_ms(self) -> Optional[float]:
         if self.utterance_started_at is None:
@@ -110,15 +119,49 @@ class MultilingualASRRouterSession:
             return None
         return (self.utterance_first_text_at - self.utterance_started_at) * 1000
 
-    def _elapsed_ms(self) -> float:
-        return (time.perf_counter() - self.started_at) * 1000
-
     def _mark_utterance_start(self) -> None:
         self.in_utterance = True
         self.current_utterance_audio = np.array([], dtype=np.float32)
-        self.utterance_started_at = time.perf_counter()
-        self.utterance_first_response_at = None
+
+        now = time.perf_counter()
+        self.utterance_started_at = now
+        self.utterance_first_server_response_at = None
         self.utterance_first_text_at = None
+
+    def _maybe_emit_audio_received(self) -> Optional[RouterOutput]:
+        """
+        This is the key fix.
+
+        It creates a server response before transcript text exists.
+        Therefore:
+        TTFB = audio_received event time
+        TTFT = first partial transcript event time
+        """
+        now = time.perf_counter()
+
+        if self.first_audio_received_at is None:
+            self.first_audio_received_at = now
+            self.first_server_response_at = now
+
+            if self.utterance_started_at is None:
+                self.utterance_started_at = now
+
+            if self.utterance_first_server_response_at is None:
+                self.utterance_first_server_response_at = now
+
+            return RouterOutput(
+                type="audio_received",
+                text="",
+                language=self.current_language,
+                ttfb_ms=self._session_ttfb_ms(),
+                ttft_ms=None,
+                elapsed_ms=self._elapsed_ms(),
+                utterance_ttfb_ms=self._utterance_ttfb_ms(),
+                utterance_ttft_ms=None,
+                asr_confidence=None,
+            )
+
+        return None
 
     def accept_audio(self, audio: np.ndarray) -> list[RouterOutput]:
         outputs: list[RouterOutput] = []
@@ -128,6 +171,10 @@ class MultilingualASRRouterSession:
 
         audio = audio.astype(np.float32, copy=False)
         self.total_audio_samples += audio.size
+
+        audio_received_event = self._maybe_emit_audio_received()
+        if audio_received_event is not None:
+            outputs.append(audio_received_event)
 
         vad_event = self.vad.accept_audio(audio) if self.vad else None
 
@@ -150,19 +197,11 @@ class MultilingualASRRouterSession:
         if partial:
             now = time.perf_counter()
 
-            # Session first response/text.
-            if self.first_server_response_at is None:
-                self.first_server_response_at = now
-
             if self.first_text_at is None:
                 self.first_text_at = now
 
-            # Utterance first response/text.
             if self.utterance_started_at is None:
                 self.utterance_started_at = now
-
-            if self.utterance_first_response_at is None:
-                self.utterance_first_response_at = now
 
             if self.utterance_first_text_at is None:
                 self.utterance_first_text_at = now
@@ -270,7 +309,7 @@ class MultilingualASRRouterSession:
         self.in_utterance = False
 
         self.utterance_started_at = None
-        self.utterance_first_response_at = None
+        self.utterance_first_server_response_at = None
         self.utterance_first_text_at = None
 
         return outputs
