@@ -6,7 +6,6 @@ from typing import Optional
 import numpy as np
 
 from app.config import (
-    LID_CONFIDENCE_THRESHOLD,
     LID_DEVICE,
     LID_LANGUAGE_ALIASES,
     LID_MIN_AUDIO_MS,
@@ -23,21 +22,13 @@ class LIDResult:
 
 
 class SpeechBrainLanguageIdentifier:
-    """
-    SpeechBrain VoxLingua107 language identifier.
-
-    This runs at utterance boundaries, not on every audio chunk.
-    That keeps routing CPU/GPU-friendly and closer to the Gladia-style design.
-    """
-
     def __init__(self):
         try:
             import torch
             from speechbrain.inference.classifiers import EncoderClassifier
         except ImportError as exc:
             raise ImportError(
-                "speechbrain and torch are required. "
-                "Install using: pip install speechbrain torch"
+                "speechbrain and torch are required. Install using: pip install speechbrain torch"
             ) from exc
 
         self.torch = torch
@@ -51,53 +42,86 @@ class SpeechBrainLanguageIdentifier:
         self.min_samples = int(SAMPLE_RATE * LID_MIN_AUDIO_MS / 1000)
 
     def detect(self, audio: np.ndarray) -> Optional[LIDResult]:
-        """
-        Detect language from one utterance worth of audio.
-        """
-        if audio.size < self.min_samples:
+        if audio is None or audio.size < self.min_samples:
+            print(
+                f"LID skipped: audio too short. "
+                f"samples={0 if audio is None else audio.size}, "
+                f"required={self.min_samples}",
+                flush=True,
+            )
             return None
 
-        wav = self.torch.from_numpy(
-            audio.astype(np.float32, copy=False)
-        ).unsqueeze(0)
+        try:
+            audio = audio.astype(np.float32, copy=False)
 
-        with self.torch.no_grad():
-            _out_prob, score, _index, text_lab = self.classifier.classify_batch(wav)
+            # SpeechBrain expects shape: [batch, time]
+            wav = self.torch.from_numpy(audio).unsqueeze(0)
 
-        label = self._label_to_string(text_lab)
-        confidence = self._score_to_float(score)
-        language = self._normalize_label(label)
+            with self.torch.no_grad():
+                _out_prob, score, _index, text_lab = self.classifier.classify_batch(
+                    wav
+                )
 
-        if language is None:
+            raw_label = self._label_to_string(text_lab)
+            confidence = self._score_to_confidence(score)
+            language = self._normalize_label(raw_label)
+
+            if language is None:
+                print(
+                    f"LID unsupported label={raw_label}, confidence={confidence}",
+                    flush=True,
+                )
+                return None
+
+            print(
+                f"LID detected label={raw_label}, "
+                f"language={language}, confidence={confidence}",
+                flush=True,
+            )
+
+            return LIDResult(
+                language=language,
+                confidence=confidence,
+                label=raw_label,
+            )
+
+        except Exception as exc:
+            print(f"LID detect failed: {exc}", flush=True)
             return None
-
-        if confidence < LID_CONFIDENCE_THRESHOLD:
-            return None
-
-        return LIDResult(
-            language=language,
-            confidence=confidence,
-            label=label,
-        )
 
     @staticmethod
     def _label_to_string(label) -> str:
         if isinstance(label, str):
-            return label
+            return label.strip()
 
         if isinstance(label, (list, tuple)) and label:
-            return str(label[0])
+            return str(label[0]).strip()
 
-        return str(label)
+        return str(label).strip()
 
     @staticmethod
-    def _score_to_float(score) -> float:
+    def _score_to_confidence(score) -> float:
         try:
             if hasattr(score, "detach"):
                 score = score.detach().cpu().numpy()
 
             arr = np.asarray(score).reshape(-1)
-            return float(arr[0])
+
+            if arr.size == 0:
+                return 0.0
+
+            value = float(arr[0])
+
+            # If SpeechBrain returns probability.
+            if 0.0 <= value <= 1.0:
+                return round(value, 4)
+
+            # If SpeechBrain returns log probability.
+            if value <= 0.0:
+                return round(float(np.exp(value)), 4)
+
+            # Fallback: convert logit-like value to probability.
+            return round(float(1.0 / (1.0 + np.exp(-value))), 4)
 
         except Exception:
             return 0.0
@@ -106,14 +130,29 @@ class SpeechBrainLanguageIdentifier:
     def _normalize_label(label: str) -> Optional[str]:
         normalized = label.lower().strip()
 
+        # Common SpeechBrain labels can be like:
+        # "en", "eng", "English", "en: English", "English: en"
         for key, value in LID_LANGUAGE_ALIASES.items():
-            key = key.lower()
+            key = key.lower().strip()
 
-            if (
-                normalized == key
-                or normalized.startswith(key + ":")
-                or key in normalized
-            ):
+            if normalized == key:
                 return value
+
+            if normalized.startswith(key + ":"):
+                return value
+
+            if key in normalized:
+                return value
+
+        if "english" in normalized or "eng" in normalized:
+            return "en"
+
+        if (
+            "spanish" in normalized
+            or "espanol" in normalized
+            or "español" in normalized
+            or "spa" in normalized
+        ):
+            return "es"
 
         return None
