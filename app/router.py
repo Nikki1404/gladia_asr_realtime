@@ -27,25 +27,22 @@ class RouterOutput:
     lid_confidence: Optional[float] = None
     lid_label: Optional[str] = None
 
-    # Latency metrics
+    # First-event session metrics.
     ttfb_ms: Optional[float] = None
     ttft_ms: Optional[float] = None
+
+    # Current event elapsed time.
     elapsed_ms: Optional[float] = None
 
-    # sherpa-onnx greedy transducer does not expose word-level confidence directly
+    # Per-utterance first text latency.
+    utterance_ttfb_ms: Optional[float] = None
+    utterance_ttft_ms: Optional[float] = None
+
+    # sherpa-onnx greedy transducer does not expose ASR word confidence.
     asr_confidence: Optional[float] = None
 
 
 class MultilingualASRRouterSession:
-    """
-    Gladia-style ASR coordinator.
-
-    Flow:
-    PCM16 bytes -> float32 -> Silero VAD -> ASR partials
-    -> speech end -> SpeechBrain LID -> optional language-route correction
-    -> utterance_final / final
-    """
-
     def __init__(
         self,
         asr_manager: ASRManager,
@@ -73,9 +70,14 @@ class MultilingualASRRouterSession:
 
         self.started_at = time.perf_counter()
 
+        # Session-level first response / first text.
         self.first_server_response_at: Optional[float] = None
         self.first_text_at: Optional[float] = None
-        self.first_partial_at: Optional[float] = None
+
+        # Utterance-level first response / first text.
+        self.utterance_started_at: Optional[float] = None
+        self.utterance_first_response_at: Optional[float] = None
+        self.utterance_first_text_at: Optional[float] = None
 
         self.full_transcript_parts: list[str] = []
 
@@ -84,15 +86,39 @@ class MultilingualASRRouterSession:
 
         self.in_utterance = False
 
-    def _ttfb_ms(self) -> Optional[float]:
+    def _session_ttfb_ms(self) -> Optional[float]:
         if self.first_server_response_at is None:
             return None
         return (self.first_server_response_at - self.started_at) * 1000
 
-    def _ttft_ms(self) -> Optional[float]:
+    def _session_ttft_ms(self) -> Optional[float]:
         if self.first_text_at is None:
             return None
         return (self.first_text_at - self.started_at) * 1000
+
+    def _utterance_ttfb_ms(self) -> Optional[float]:
+        if self.utterance_started_at is None:
+            return None
+        if self.utterance_first_response_at is None:
+            return None
+        return (self.utterance_first_response_at - self.utterance_started_at) * 1000
+
+    def _utterance_ttft_ms(self) -> Optional[float]:
+        if self.utterance_started_at is None:
+            return None
+        if self.utterance_first_text_at is None:
+            return None
+        return (self.utterance_first_text_at - self.utterance_started_at) * 1000
+
+    def _elapsed_ms(self) -> float:
+        return (time.perf_counter() - self.started_at) * 1000
+
+    def _mark_utterance_start(self) -> None:
+        self.in_utterance = True
+        self.current_utterance_audio = np.array([], dtype=np.float32)
+        self.utterance_started_at = time.perf_counter()
+        self.utterance_first_response_at = None
+        self.utterance_first_text_at = None
 
     def accept_audio(self, audio: np.ndarray) -> list[RouterOutput]:
         outputs: list[RouterOutput] = []
@@ -106,11 +132,10 @@ class MultilingualASRRouterSession:
         vad_event = self.vad.accept_audio(audio) if self.vad else None
 
         if vad_event and vad_event.type == "speech_start":
-            self.in_utterance = True
-            self.current_utterance_audio = np.array([], dtype=np.float32)
+            self._mark_utterance_start()
 
-        if not self.vad:
-            self.in_utterance = True
+        if not self.vad and not self.in_utterance:
+            self._mark_utterance_start()
 
         if self.in_utterance:
             self.current_utterance_audio = np.concatenate(
@@ -125,23 +150,33 @@ class MultilingualASRRouterSession:
         if partial:
             now = time.perf_counter()
 
+            # Session first response/text.
             if self.first_server_response_at is None:
                 self.first_server_response_at = now
 
             if self.first_text_at is None:
                 self.first_text_at = now
 
-            if self.first_partial_at is None:
-                self.first_partial_at = now
+            # Utterance first response/text.
+            if self.utterance_started_at is None:
+                self.utterance_started_at = now
+
+            if self.utterance_first_response_at is None:
+                self.utterance_first_response_at = now
+
+            if self.utterance_first_text_at is None:
+                self.utterance_first_text_at = now
 
             outputs.append(
                 RouterOutput(
                     type="partial",
                     text=partial,
                     language=self.current_language,
-                    ttfb_ms=self._ttfb_ms(),
-                    ttft_ms=self._ttft_ms(),
-                    elapsed_ms=(now - self.started_at) * 1000,
+                    ttfb_ms=self._session_ttfb_ms(),
+                    ttft_ms=self._session_ttft_ms(),
+                    elapsed_ms=self._elapsed_ms(),
+                    utterance_ttfb_ms=self._utterance_ttfb_ms(),
+                    utterance_ttft_ms=self._utterance_ttft_ms(),
                     asr_confidence=None,
                 )
             )
@@ -190,9 +225,11 @@ class MultilingualASRRouterSession:
                         detected_language=final_language,
                         lid_confidence=lid_result.confidence,
                         lid_label=lid_result.label,
-                        ttfb_ms=self._ttfb_ms(),
-                        ttft_ms=self._ttft_ms(),
-                        elapsed_ms=(time.perf_counter() - self.started_at) * 1000,
+                        ttfb_ms=self._session_ttfb_ms(),
+                        ttft_ms=self._session_ttft_ms(),
+                        elapsed_ms=self._elapsed_ms(),
+                        utterance_ttfb_ms=self._utterance_ttfb_ms(),
+                        utterance_ttft_ms=self._utterance_ttft_ms(),
                         asr_confidence=None,
                     )
                 )
@@ -220,15 +257,21 @@ class MultilingualASRRouterSession:
                 detected_language=lid_result.language if lid_result else None,
                 lid_confidence=lid_result.confidence if lid_result else None,
                 lid_label=lid_result.label if lid_result else None,
-                ttfb_ms=self._ttfb_ms(),
-                ttft_ms=self._ttft_ms(),
-                elapsed_ms=(time.perf_counter() - self.started_at) * 1000,
+                ttfb_ms=self._session_ttfb_ms(),
+                ttft_ms=self._session_ttft_ms(),
+                elapsed_ms=self._elapsed_ms(),
+                utterance_ttfb_ms=self._utterance_ttfb_ms(),
+                utterance_ttft_ms=self._utterance_ttft_ms(),
                 asr_confidence=None,
             )
         )
 
         self.current_utterance_audio = np.array([], dtype=np.float32)
         self.in_utterance = False
+
+        self.utterance_started_at = None
+        self.utterance_first_response_at = None
+        self.utterance_first_text_at = None
 
         return outputs
 
@@ -252,9 +295,11 @@ class MultilingualASRRouterSession:
                 type="final",
                 text=full_text,
                 language=self.current_language,
-                ttfb_ms=self._ttfb_ms(),
-                ttft_ms=self._ttft_ms(),
-                elapsed_ms=(time.perf_counter() - self.started_at) * 1000,
+                ttfb_ms=self._session_ttfb_ms(),
+                ttft_ms=self._session_ttft_ms(),
+                elapsed_ms=self._elapsed_ms(),
+                utterance_ttfb_ms=None,
+                utterance_ttft_ms=None,
                 asr_confidence=None,
             )
         )
