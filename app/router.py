@@ -26,25 +26,24 @@ class RouterOutput:
     detected_language: Optional[str] = None
     lid_confidence: Optional[float] = None
     lid_label: Optional[str] = None
+
+    # Latency metrics
     ttfb_ms: Optional[float] = None
+    ttft_ms: Optional[float] = None
     elapsed_ms: Optional[float] = None
+
+    # sherpa-onnx greedy transducer does not expose word-level confidence directly
+    asr_confidence: Optional[float] = None
 
 
 class MultilingualASRRouterSession:
     """
-    Gladia-style ASR coordinator adapted to this simple project.
+    Gladia-style ASR coordinator.
 
     Flow:
-    1. Client sends PCM16 mono 16 kHz bytes.
-    2. Server converts PCM16 to float32.
-    3. Silero VAD detects speech boundaries.
-    4. Current monolingual ASR emits partials.
-    5. At speech end:
-       - finalize current ASR stream
-       - run SpeechBrain LID on utterance audio
-       - if LID says another supported language, re-transcribe that utterance
-         with the detected language model
-       - switch future route to the detected language
+    PCM16 bytes -> float32 -> Silero VAD -> ASR partials
+    -> speech end -> SpeechBrain LID -> optional language-route correction
+    -> utterance_final / final
     """
 
     def __init__(
@@ -73,6 +72,9 @@ class MultilingualASRRouterSession:
         self.lid = SpeechBrainLanguageIdentifier() if self.enable_lid else None
 
         self.started_at = time.perf_counter()
+
+        self.first_server_response_at: Optional[float] = None
+        self.first_text_at: Optional[float] = None
         self.first_partial_at: Optional[float] = None
 
         self.full_transcript_parts: list[str] = []
@@ -82,10 +84,17 @@ class MultilingualASRRouterSession:
 
         self.in_utterance = False
 
+    def _ttfb_ms(self) -> Optional[float]:
+        if self.first_server_response_at is None:
+            return None
+        return (self.first_server_response_at - self.started_at) * 1000
+
+    def _ttft_ms(self) -> Optional[float]:
+        if self.first_text_at is None:
+            return None
+        return (self.first_text_at - self.started_at) * 1000
+
     def accept_audio(self, audio: np.ndarray) -> list[RouterOutput]:
-        """
-        Accept one chunk of float32 audio.
-        """
         outputs: list[RouterOutput] = []
 
         if audio.size == 0:
@@ -100,7 +109,6 @@ class MultilingualASRRouterSession:
             self.in_utterance = True
             self.current_utterance_audio = np.array([], dtype=np.float32)
 
-        # If VAD is disabled, treat stream as continuous speech.
         if not self.vad:
             self.in_utterance = True
 
@@ -117,6 +125,12 @@ class MultilingualASRRouterSession:
         if partial:
             now = time.perf_counter()
 
+            if self.first_server_response_at is None:
+                self.first_server_response_at = now
+
+            if self.first_text_at is None:
+                self.first_text_at = now
+
             if self.first_partial_at is None:
                 self.first_partial_at = now
 
@@ -125,8 +139,10 @@ class MultilingualASRRouterSession:
                     type="partial",
                     text=partial,
                     language=self.current_language,
-                    ttfb_ms=(self.first_partial_at - self.started_at) * 1000,
+                    ttfb_ms=self._ttfb_ms(),
+                    ttft_ms=self._ttft_ms(),
                     elapsed_ms=(now - self.started_at) * 1000,
+                    asr_confidence=None,
                 )
             )
 
@@ -136,9 +152,6 @@ class MultilingualASRRouterSession:
         return outputs
 
     def _finalize_utterance(self) -> list[RouterOutput]:
-        """
-        Finalize current utterance and optionally correct language route.
-        """
         outputs: list[RouterOutput] = []
 
         raw_final = self.asr_session.finalize(reset_after=True).strip()
@@ -177,7 +190,10 @@ class MultilingualASRRouterSession:
                         detected_language=final_language,
                         lid_confidence=lid_result.confidence,
                         lid_label=lid_result.label,
+                        ttfb_ms=self._ttfb_ms(),
+                        ttft_ms=self._ttft_ms(),
                         elapsed_ms=(time.perf_counter() - self.started_at) * 1000,
+                        asr_confidence=None,
                     )
                 )
 
@@ -204,7 +220,10 @@ class MultilingualASRRouterSession:
                 detected_language=lid_result.language if lid_result else None,
                 lid_confidence=lid_result.confidence if lid_result else None,
                 lid_label=lid_result.label if lid_result else None,
+                ttfb_ms=self._ttfb_ms(),
+                ttft_ms=self._ttft_ms(),
                 elapsed_ms=(time.perf_counter() - self.started_at) * 1000,
+                asr_confidence=None,
             )
         )
 
@@ -214,9 +233,6 @@ class MultilingualASRRouterSession:
         return outputs
 
     def finalize_stream(self) -> list[RouterOutput]:
-        """
-        Called when client sends {"type": "end"}.
-        """
         outputs: list[RouterOutput] = []
 
         if self.current_utterance_audio.size > 0:
@@ -236,7 +252,10 @@ class MultilingualASRRouterSession:
                 type="final",
                 text=full_text,
                 language=self.current_language,
+                ttfb_ms=self._ttfb_ms(),
+                ttft_ms=self._ttft_ms(),
                 elapsed_ms=(time.perf_counter() - self.started_at) * 1000,
+                asr_confidence=None,
             )
         )
 
