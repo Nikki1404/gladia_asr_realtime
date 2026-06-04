@@ -54,16 +54,19 @@ def router_output_to_payload(output: RouterOutput, session_id: str) -> dict:
     if output.lid_label is not None:
         payload["lid_label"] = output.lid_label
 
-    if output.asr_confidence is not None:
-        payload["asr_confidence"] = round(output.asr_confidence, 4)
-    else:
-        payload["asr_confidence"] = None
+    payload["asr_confidence"] = (
+        round(output.asr_confidence, 4)
+        if output.asr_confidence is not None
+        else None
+    )
 
     if output.ttfb_ms is not None:
         payload["ttfb_ms"] = round(output.ttfb_ms, 2)
 
     if output.ttft_ms is not None:
         payload["ttft_ms"] = round(output.ttft_ms, 2)
+    else:
+        payload["ttft_ms"] = None
 
     if output.elapsed_ms is not None:
         payload["elapsed_ms"] = round(output.elapsed_ms, 2)
@@ -73,6 +76,8 @@ def router_output_to_payload(output: RouterOutput, session_id: str) -> dict:
 
     if output.utterance_ttft_ms is not None:
         payload["utterance_ttft_ms"] = round(output.utterance_ttft_ms, 2)
+    else:
+        payload["utterance_ttft_ms"] = None
 
     return payload
 
@@ -277,11 +282,20 @@ async def websocket_asr(websocket: WebSocket):
                         session_id=session_id,
                     )
 
-                    if output.type == "partial":
+                    if output.type == "audio_received":
+                        print(
+                            f"[{session_id}] AUDIO_RECEIVED "
+                            f"ttfb={payload.get('ttfb_ms')}ms "
+                            f"ttft={payload.get('ttft_ms')} "
+                            f"elapsed={payload.get('elapsed_ms')}ms",
+                            flush=True,
+                        )
+
+                    elif output.type == "partial":
                         print(
                             f"[{session_id}] PARTIAL [{output.language}] "
-                            f"session_ttfb={payload.get('ttfb_ms')}ms "
-                            f"session_ttft={payload.get('ttft_ms')}ms "
+                            f"ttfb={payload.get('ttfb_ms')}ms "
+                            f"ttft={payload.get('ttft_ms')}ms "
                             f"utterance_ttfb={payload.get('utterance_ttfb_ms')}ms "
                             f"utterance_ttft={payload.get('utterance_ttft_ms')}ms "
                             f"elapsed={payload.get('elapsed_ms')}ms "
@@ -293,8 +307,8 @@ async def websocket_asr(websocket: WebSocket):
                         print(
                             f"[{session_id}] LANGUAGE_SWITCH "
                             f"{output.language} -> {output.detected_language} "
-                            f"session_ttfb={payload.get('ttfb_ms')}ms "
-                            f"session_ttft={payload.get('ttft_ms')}ms "
+                            f"ttfb={payload.get('ttfb_ms')}ms "
+                            f"ttft={payload.get('ttft_ms')}ms "
                             f"elapsed={payload.get('elapsed_ms')}ms "
                             f"lid_conf={payload.get('lid_confidence')} "
                             f"lid_label={payload.get('lid_label')}",
@@ -304,8 +318,8 @@ async def websocket_asr(websocket: WebSocket):
                     elif output.type == "utterance_final":
                         print(
                             f"[{session_id}] UTTERANCE_FINAL [{output.language}] "
-                            f"session_ttfb={payload.get('ttfb_ms')}ms "
-                            f"session_ttft={payload.get('ttft_ms')}ms "
+                            f"ttfb={payload.get('ttfb_ms')}ms "
+                            f"ttft={payload.get('ttft_ms')}ms "
                             f"utterance_ttfb={payload.get('utterance_ttfb_ms')}ms "
                             f"utterance_ttft={payload.get('utterance_ttft_ms')}ms "
                             f"elapsed={payload.get('elapsed_ms')}ms "
@@ -354,5 +368,4 @@ async def websocket_asr(websocket: WebSocket):
 
     finally:
         print(f"[{session_id}] websocket closed", flush=True)
-
 
