@@ -123,20 +123,103 @@ def calculate_asr_metrics(reference_text: str, hypothesis_text: str) -> dict:
     }
 
 
-async def receiver(ws) -> dict:
+def calculate_latency_fields(
+    data: dict,
+    client_receive_ts_ms: float,
+    timing_holder: dict,
+) -> dict:
+    msg_type = data.get("type")
+    text = data.get("text", "") or ""
+
+    server_send_ts_ms = data.get("server_send_ts_ms")
+    server_audio_received_ts_ms = data.get("server_audio_received_ts_ms")
+    utterance_start_ts_ms = data.get("utterance_start_ts_ms")
+
+    latency_ms = None
+    if server_send_ts_ms is not None:
+        latency_ms = round(
+            client_receive_ts_ms - float(server_send_ts_ms),
+            2,
+        )
+
+    # Per-event TTFB:
+    # How long server took to send this response after it received latest audio chunk.
+    ttfb_ms = None
+    if (
+        server_send_ts_ms is not None
+        and server_audio_received_ts_ms is not None
+        and msg_type not in {"ready", "loading", "config_ack"}
+    ):
+        ttfb_ms = round(
+            float(server_send_ts_ms) - float(server_audio_received_ts_ms),
+            2,
+        )
+
+    # Per-event TTFT:
+    # For text messages, how long from current utterance start to this text output.
+    # This is intentionally different from TTFB.
+    ttft_ms = None
+    if (
+        server_send_ts_ms is not None
+        and utterance_start_ts_ms is not None
+        and text.strip()
+    ):
+        ttft_ms = round(
+            float(server_send_ts_ms) - float(utterance_start_ts_ms),
+            2,
+        )
+
+    first_audio_send_ts_ms = timing_holder.get("first_audio_send_ts_ms")
+
+    if (
+        timing_holder.get("session_ttfb_ms") is None
+        and first_audio_send_ts_ms is not None
+        and msg_type not in {"ready", "loading", "config_ack"}
+    ):
+        timing_holder["session_ttfb_ms"] = round(
+            client_receive_ts_ms - first_audio_send_ts_ms,
+            2,
+        )
+        timing_holder["first_response_type"] = msg_type
+
+    if (
+        timing_holder.get("session_ttft_ms") is None
+        and first_audio_send_ts_ms is not None
+        and text.strip()
+    ):
+        timing_holder["session_ttft_ms"] = round(
+            client_receive_ts_ms - first_audio_send_ts_ms,
+            2,
+        )
+        timing_holder["first_text_type"] = msg_type
+
+    return {
+        "latency_ms": latency_ms,
+        "ttfb_ms": ttfb_ms,
+        "ttft_ms": ttft_ms,
+        "session_ttfb_ms": timing_holder.get("session_ttfb_ms"),
+        "session_ttft_ms": timing_holder.get("session_ttft_ms"),
+        "first_response_type": timing_holder.get("first_response_type"),
+        "first_text_type": timing_holder.get("first_text_type"),
+    }
+
+
+async def receiver(ws, timing_holder: dict) -> dict:
     result = {
         "partials": [],
         "utterance_finals": [],
         "language_switches": [],
+        "event_metrics": [],
+
         "final_text": "",
 
-        "server_ttfb_ms": None,
-        "server_ttft_ms": None,
-        "server_final_elapsed_ms": None,
+        "session_ttfb_ms": None,
+        "session_ttft_ms": None,
+        "first_response_type": None,
+        "first_text_type": None,
 
-        "audio_received_elapsed_ms": None,
-        "first_partial_elapsed_ms": None,
-        "last_partial_elapsed_ms": None,
+        "final_latency_ms": None,
+        "server_final_elapsed_ms": None,
 
         "asr_confidence": None,
 
@@ -146,56 +229,87 @@ async def receiver(ws) -> dict:
     }
 
     async for message in ws:
+        client_receive_ts_ms = time.time() * 1000.0
         data = json.loads(message)
+
         msg_type = data.get("type")
+        text = data.get("text", "") or ""
+
+        latency_fields = calculate_latency_fields(
+            data=data,
+            client_receive_ts_ms=client_receive_ts_ms,
+            timing_holder=timing_holder,
+        )
+
+        latency_ms = latency_fields["latency_ms"]
+        ttfb_ms = latency_fields["ttfb_ms"]
+        ttft_ms = latency_fields["ttft_ms"]
+        session_ttfb_ms = latency_fields["session_ttfb_ms"]
+        session_ttft_ms = latency_fields["session_ttft_ms"]
+
+        if msg_type in {
+            "audio_received",
+            "partial",
+            "utterance_final",
+            "language_switch",
+            "final",
+        }:
+            result["event_metrics"].append(
+                {
+                    "type": msg_type,
+                    "language": data.get("language"),
+                    "latency_ms": latency_ms,
+                    "ttfb_ms": ttfb_ms,
+                    "ttft_ms": ttft_ms,
+                    "session_ttfb_ms": session_ttfb_ms,
+                    "session_ttft_ms": session_ttft_ms,
+                    "server_elapsed_ms": data.get("server_elapsed_ms"),
+                    "client_receive_ts_ms": round(client_receive_ts_ms, 3),
+                    "server_send_ts_ms": data.get("server_send_ts_ms"),
+                    "server_audio_received_ts_ms": data.get(
+                        "server_audio_received_ts_ms"
+                    ),
+                    "utterance_start_ts_ms": data.get("utterance_start_ts_ms"),
+                    "lid_confidence": data.get("lid_confidence"),
+                    "lid_label": data.get("lid_label"),
+                    "text": text,
+                }
+            )
 
         if msg_type in {"ready", "loading", "config_ack"}:
             print(data)
 
         elif msg_type == "audio_received":
-            result["server_ttfb_ms"] = data.get("ttfb_ms")
-            result["audio_received_elapsed_ms"] = data.get("elapsed_ms")
-
             print(
                 f"AUDIO_RECEIVED "
-                f"ttfb={data.get('ttfb_ms')}ms "
-                f"ttft={data.get('ttft_ms')} "
-                f"elapsed={data.get('elapsed_ms')}ms"
+                f"latency_ms={latency_ms} "
+                f"ttfb_ms={ttfb_ms} "
+                f"ttft_ms={ttft_ms} "
+                f"session_ttfb_ms={session_ttfb_ms} "
+                f"session_ttft_ms={session_ttft_ms} "
+                f"server_elapsed_ms={data.get('server_elapsed_ms')}"
             )
 
         elif msg_type == "partial":
-            text = data.get("text", "")
-
             if text:
                 result["partials"].append(text)
-
-                if result["server_ttfb_ms"] is None:
-                    result["server_ttfb_ms"] = data.get("ttfb_ms")
-
-                if result["server_ttft_ms"] is None:
-                    result["server_ttft_ms"] = data.get("ttft_ms")
-
-                if result["first_partial_elapsed_ms"] is None:
-                    result["first_partial_elapsed_ms"] = data.get("elapsed_ms")
-
-                result["last_partial_elapsed_ms"] = data.get("elapsed_ms")
 
                 if result["asr_confidence"] is None:
                     result["asr_confidence"] = data.get("asr_confidence")
 
             print(
                 f"PARTIAL [{data.get('language')}] "
-                f"ttfb={data.get('ttfb_ms')}ms "
-                f"ttft={data.get('ttft_ms')}ms "
-                f"utterance_ttfb={data.get('utterance_ttfb_ms')}ms "
-                f"utterance_ttft={data.get('utterance_ttft_ms')}ms "
-                f"elapsed={data.get('elapsed_ms')}ms "
-                f"asr_conf={data.get('asr_confidence')} : "
+                f"latency_ms={latency_ms} "
+                f"ttfb_ms={ttfb_ms} "
+                f"ttft_ms={ttft_ms} "
+                f"session_ttfb_ms={session_ttfb_ms} "
+                f"session_ttft_ms={session_ttft_ms} "
+                f"server_elapsed_ms={data.get('server_elapsed_ms')} "
+                f"conf={data.get('asr_confidence')} : "
                 f"{text}"
             )
 
         elif msg_type == "utterance_final":
-            text = data.get("text", "")
             result["utterance_finals"].append(text)
 
             lid_conf = data.get("lid_confidence")
@@ -208,19 +322,14 @@ async def receiver(ws) -> dict:
             if lid_label is not None:
                 result["last_lid_label"] = lid_label
 
-            if result["server_ttfb_ms"] is None:
-                result["server_ttfb_ms"] = data.get("ttfb_ms")
-
-            if result["server_ttft_ms"] is None:
-                result["server_ttft_ms"] = data.get("ttft_ms")
-
             print(
                 f"\nUTTERANCE_FINAL [{data.get('language')}] "
-                f"ttfb={data.get('ttfb_ms')}ms "
-                f"ttft={data.get('ttft_ms')}ms "
-                f"utterance_ttfb={data.get('utterance_ttfb_ms')}ms "
-                f"utterance_ttft={data.get('utterance_ttft_ms')}ms "
-                f"elapsed={data.get('elapsed_ms')}ms "
+                f"latency_ms={latency_ms} "
+                f"ttfb_ms={ttfb_ms} "
+                f"ttft_ms={ttft_ms} "
+                f"session_ttfb_ms={session_ttfb_ms} "
+                f"session_ttft_ms={session_ttft_ms} "
+                f"server_elapsed_ms={data.get('server_elapsed_ms')} "
                 f"lid_conf={lid_conf} "
                 f"lid_label={lid_label} : "
                 f"{text}"
@@ -232,37 +341,30 @@ async def receiver(ws) -> dict:
             print(
                 f"\nLANGUAGE_SWITCH "
                 f"{data.get('language')} -> {data.get('detected_language')} "
-                f"ttfb={data.get('ttfb_ms')}ms "
-                f"ttft={data.get('ttft_ms')}ms "
-                f"elapsed={data.get('elapsed_ms')}ms "
+                f"latency_ms={latency_ms} "
+                f"ttfb_ms={ttfb_ms} "
+                f"ttft_ms={ttft_ms} "
+                f"session_ttfb_ms={session_ttfb_ms} "
+                f"session_ttft_ms={session_ttft_ms} "
                 f"lid_conf={data.get('lid_confidence')} "
-                f"label={data.get('lid_label')}"
+                f"lid_label={data.get('lid_label')}"
             )
 
-            if data.get("text"):
-                print(
-                    f"REVISION [{data.get('detected_language')}]: "
-                    f"{data.get('text')}"
-                )
-
         elif msg_type == "final":
-            final_text = data.get("text", "")
-            result["final_text"] = final_text
-            result["server_final_elapsed_ms"] = data.get("elapsed_ms")
-
-            if result["server_ttfb_ms"] is None:
-                result["server_ttfb_ms"] = data.get("ttfb_ms")
-
-            if result["server_ttft_ms"] is None:
-                result["server_ttft_ms"] = data.get("ttft_ms")
+            result["final_text"] = text
+            result["final_latency_ms"] = latency_ms
+            result["server_final_elapsed_ms"] = data.get("server_elapsed_ms")
 
             print(
                 f"\nFINAL [{data.get('language')}] "
-                f"ttfb={data.get('ttfb_ms')}ms "
-                f"ttft={data.get('ttft_ms')}ms "
-                f"elapsed={data.get('elapsed_ms')}ms "
-                f"asr_conf={data.get('asr_confidence')} : "
-                f"{final_text}"
+                f"latency_ms={latency_ms} "
+                f"ttfb_ms={ttfb_ms} "
+                f"ttft_ms={ttft_ms} "
+                f"session_ttfb_ms={session_ttfb_ms} "
+                f"session_ttft_ms={session_ttft_ms} "
+                f"server_elapsed_ms={data.get('server_elapsed_ms')} "
+                f"conf={data.get('asr_confidence')} : "
+                f"{text}"
             )
 
             if data.get("stream_end", True):
@@ -273,6 +375,11 @@ async def receiver(ws) -> dict:
 
         else:
             print(data)
+
+    result["session_ttfb_ms"] = timing_holder.get("session_ttfb_ms")
+    result["session_ttft_ms"] = timing_holder.get("session_ttft_ms")
+    result["first_response_type"] = timing_holder.get("first_response_type")
+    result["first_text_type"] = timing_holder.get("first_text_type")
 
     return result
 
@@ -305,6 +412,14 @@ async def run_file(
     first_audio_send_time = None
     last_audio_send_time = None
 
+    timing_holder = {
+        "first_audio_send_ts_ms": None,
+        "session_ttfb_ms": None,
+        "session_ttft_ms": None,
+        "first_response_type": None,
+        "first_text_type": None,
+    }
+
     async with websockets.connect(
         url,
         max_size=None,
@@ -314,11 +429,19 @@ async def run_file(
     ) as ws:
         await send_config(ws, language)
 
-        recv_task = asyncio.create_task(receiver(ws))
+        recv_task = asyncio.create_task(
+            receiver(
+                ws,
+                timing_holder,
+            )
+        )
 
         for i in range(0, len(audio_bytes), bytes_per_chunk):
+            now = time.time()
+
             if first_audio_send_time is None:
-                first_audio_send_time = time.time()
+                first_audio_send_time = now
+                timing_holder["first_audio_send_ts_ms"] = now * 1000.0
 
             chunk = audio_bytes[i : i + bytes_per_chunk]
             await ws.send(chunk)
@@ -361,6 +484,7 @@ async def run_file(
         "file": file_path,
         "language": language,
         "chunk_ms": chunk_ms,
+
         "audio_duration_sec": round(audio_duration_sec, 3),
         "client_total_elapsed_sec": round(total_client_elapsed_sec, 3),
         "streaming_elapsed_sec": round(streaming_elapsed_sec, 3)
@@ -370,13 +494,15 @@ async def run_file(
         if real_time_factor is not None
         else None,
 
-        "server_ttfb_ms": receive_result.get("server_ttfb_ms"),
-        "server_ttft_ms": receive_result.get("server_ttft_ms"),
+        "session_ttfb_ms": receive_result.get("session_ttfb_ms"),
+        "session_ttft_ms": receive_result.get("session_ttft_ms"),
+        "first_response_type": receive_result.get("first_response_type"),
+        "first_text_type": receive_result.get("first_text_type"),
+
+        "final_latency_ms": receive_result.get("final_latency_ms"),
         "server_final_elapsed_ms": receive_result.get("server_final_elapsed_ms"),
 
-        "audio_received_elapsed_ms": receive_result.get("audio_received_elapsed_ms"),
-        "first_partial_elapsed_ms": receive_result.get("first_partial_elapsed_ms"),
-        "last_partial_elapsed_ms": receive_result.get("last_partial_elapsed_ms"),
+        "event_metrics": receive_result.get("event_metrics", []),
 
         "asr_confidence": receive_result.get("asr_confidence"),
 
@@ -454,6 +580,14 @@ async def run_mic(
         frames_per_buffer=frames_per_buffer,
     )
 
+    timing_holder = {
+        "first_audio_send_ts_ms": None,
+        "session_ttfb_ms": None,
+        "session_ttft_ms": None,
+        "first_response_type": None,
+        "first_text_type": None,
+    }
+
     print("Mic streaming started. Press Ctrl+C to stop.")
 
     async with websockets.connect(
@@ -465,7 +599,12 @@ async def run_mic(
     ) as ws:
         await send_config(ws, language)
 
-        recv_task = asyncio.create_task(receiver(ws))
+        recv_task = asyncio.create_task(
+            receiver(
+                ws,
+                timing_holder,
+            )
+        )
 
         try:
             while True:
@@ -473,6 +612,11 @@ async def run_mic(
                     frames_per_buffer,
                     exception_on_overflow=False,
                 )
+
+                now = time.time()
+
+                if timing_holder["first_audio_send_ts_ms"] is None:
+                    timing_holder["first_audio_send_ts_ms"] = now * 1000.0
 
                 await ws.send(data)
                 await asyncio.sleep(0)
