@@ -129,10 +129,17 @@ async def receiver(ws) -> dict:
         "utterance_finals": [],
         "language_switches": [],
         "final_text": "",
+
         "server_ttfb_ms": None,
         "server_ttft_ms": None,
         "server_final_elapsed_ms": None,
+
+        "audio_received_elapsed_ms": None,
+        "first_partial_elapsed_ms": None,
+        "last_partial_elapsed_ms": None,
+
         "asr_confidence": None,
+
         "lid_confidences": [],
         "last_lid_confidence": None,
         "last_lid_label": None,
@@ -144,6 +151,17 @@ async def receiver(ws) -> dict:
 
         if msg_type in {"ready", "loading", "config_ack"}:
             print(data)
+
+        elif msg_type == "audio_received":
+            result["server_ttfb_ms"] = data.get("ttfb_ms")
+            result["audio_received_elapsed_ms"] = data.get("elapsed_ms")
+
+            print(
+                f"AUDIO_RECEIVED "
+                f"ttfb={data.get('ttfb_ms')}ms "
+                f"ttft={data.get('ttft_ms')} "
+                f"elapsed={data.get('elapsed_ms')}ms"
+            )
 
         elif msg_type == "partial":
             text = data.get("text", "")
@@ -157,6 +175,11 @@ async def receiver(ws) -> dict:
                 if result["server_ttft_ms"] is None:
                     result["server_ttft_ms"] = data.get("ttft_ms")
 
+                if result["first_partial_elapsed_ms"] is None:
+                    result["first_partial_elapsed_ms"] = data.get("elapsed_ms")
+
+                result["last_partial_elapsed_ms"] = data.get("elapsed_ms")
+
                 if result["asr_confidence"] is None:
                     result["asr_confidence"] = data.get("asr_confidence")
 
@@ -164,7 +187,10 @@ async def receiver(ws) -> dict:
                 f"PARTIAL [{data.get('language')}] "
                 f"ttfb={data.get('ttfb_ms')}ms "
                 f"ttft={data.get('ttft_ms')}ms "
-                f"conf={data.get('asr_confidence')} : "
+                f"utterance_ttfb={data.get('utterance_ttfb_ms')}ms "
+                f"utterance_ttft={data.get('utterance_ttft_ms')}ms "
+                f"elapsed={data.get('elapsed_ms')}ms "
+                f"asr_conf={data.get('asr_confidence')} : "
                 f"{text}"
             )
 
@@ -192,6 +218,9 @@ async def receiver(ws) -> dict:
                 f"\nUTTERANCE_FINAL [{data.get('language')}] "
                 f"ttfb={data.get('ttfb_ms')}ms "
                 f"ttft={data.get('ttft_ms')}ms "
+                f"utterance_ttfb={data.get('utterance_ttfb_ms')}ms "
+                f"utterance_ttft={data.get('utterance_ttft_ms')}ms "
+                f"elapsed={data.get('elapsed_ms')}ms "
                 f"lid_conf={lid_conf} "
                 f"lid_label={lid_label} : "
                 f"{text}"
@@ -205,7 +234,8 @@ async def receiver(ws) -> dict:
                 f"{data.get('language')} -> {data.get('detected_language')} "
                 f"ttfb={data.get('ttfb_ms')}ms "
                 f"ttft={data.get('ttft_ms')}ms "
-                f"conf={data.get('lid_confidence')} "
+                f"elapsed={data.get('elapsed_ms')}ms "
+                f"lid_conf={data.get('lid_confidence')} "
                 f"label={data.get('lid_label')}"
             )
 
@@ -231,7 +261,7 @@ async def receiver(ws) -> dict:
                 f"ttfb={data.get('ttfb_ms')}ms "
                 f"ttft={data.get('ttft_ms')}ms "
                 f"elapsed={data.get('elapsed_ms')}ms "
-                f"conf={data.get('asr_confidence')} : "
+                f"asr_conf={data.get('asr_confidence')} : "
                 f"{final_text}"
             )
 
@@ -339,16 +369,25 @@ async def run_file(
         "real_time_factor": round(real_time_factor, 3)
         if real_time_factor is not None
         else None,
+
         "server_ttfb_ms": receive_result.get("server_ttfb_ms"),
         "server_ttft_ms": receive_result.get("server_ttft_ms"),
         "server_final_elapsed_ms": receive_result.get("server_final_elapsed_ms"),
+
+        "audio_received_elapsed_ms": receive_result.get("audio_received_elapsed_ms"),
+        "first_partial_elapsed_ms": receive_result.get("first_partial_elapsed_ms"),
+        "last_partial_elapsed_ms": receive_result.get("last_partial_elapsed_ms"),
+
         "asr_confidence": receive_result.get("asr_confidence"),
+
         "last_lid_confidence": receive_result.get("last_lid_confidence"),
         "avg_lid_confidence": avg_lid_confidence,
         "last_lid_label": receive_result.get("last_lid_label"),
+
         "partial_count": len(receive_result.get("partials", [])),
         "utterance_count": len(receive_result.get("utterance_finals", [])),
         "language_switch_count": len(receive_result.get("language_switches", [])),
+
         "final_text": final_text,
     }
 
