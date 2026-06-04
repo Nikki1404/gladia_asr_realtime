@@ -53,8 +53,6 @@ class SpeechBrainLanguageIdentifier:
 
         try:
             audio = audio.astype(np.float32, copy=False)
-
-            # SpeechBrain expects shape: [batch, time]
             wav = self.torch.from_numpy(audio).unsqueeze(0)
 
             with self.torch.no_grad():
@@ -112,15 +110,12 @@ class SpeechBrainLanguageIdentifier:
 
             value = float(arr[0])
 
-            # If SpeechBrain returns probability.
             if 0.0 <= value <= 1.0:
                 return round(value, 4)
 
-            # If SpeechBrain returns log probability.
             if value <= 0.0:
                 return round(float(np.exp(value)), 4)
 
-            # Fallback: convert logit-like value to probability.
             return round(float(1.0 / (1.0 + np.exp(-value))), 4)
 
         except Exception:
@@ -130,8 +125,6 @@ class SpeechBrainLanguageIdentifier:
     def _normalize_label(label: str) -> Optional[str]:
         normalized = label.lower().strip()
 
-        # Common SpeechBrain labels can be like:
-        # "en", "eng", "English", "en: English", "English: en"
         for key, value in LID_LANGUAGE_ALIASES.items():
             key = key.lower().strip()
 
