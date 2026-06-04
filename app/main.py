@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from typing import Optional
 
@@ -42,6 +43,21 @@ def router_output_to_payload(output: RouterOutput, session_id: str) -> dict:
         "session_id": session_id,
         "language": output.language,
         "text": output.text,
+
+        # Refreshed again immediately before send.
+        "server_send_ts_ms": time.time() * 1000.0,
+
+        # Used by client to calculate per-event TTFB.
+        "server_audio_received_ts_ms": output.server_audio_received_ts_ms,
+
+        # Used by client to calculate per-event TTFT.
+        "utterance_start_ts_ms": output.utterance_start_ts_ms,
+
+        "server_elapsed_ms": (
+            round(output.server_elapsed_ms, 2)
+            if output.server_elapsed_ms is not None
+            else None
+        ),
     }
 
     if output.detected_language is not None:
@@ -60,26 +76,13 @@ def router_output_to_payload(output: RouterOutput, session_id: str) -> dict:
         else None
     )
 
-    if output.ttfb_ms is not None:
-        payload["ttfb_ms"] = round(output.ttfb_ms, 2)
-
-    if output.ttft_ms is not None:
-        payload["ttft_ms"] = round(output.ttft_ms, 2)
-    else:
-        payload["ttft_ms"] = None
-
-    if output.elapsed_ms is not None:
-        payload["elapsed_ms"] = round(output.elapsed_ms, 2)
-
-    if output.utterance_ttfb_ms is not None:
-        payload["utterance_ttfb_ms"] = round(output.utterance_ttfb_ms, 2)
-
-    if output.utterance_ttft_ms is not None:
-        payload["utterance_ttft_ms"] = round(output.utterance_ttft_ms, 2)
-    else:
-        payload["utterance_ttft_ms"] = None
-
     return payload
+
+
+async def send_payload(websocket: WebSocket, payload: dict) -> None:
+    # Critical: update timestamp immediately before sending to client.
+    payload["server_send_ts_ms"] = time.time() * 1000.0
+    await websocket.send_text(json.dumps(payload))
 
 
 def create_router(session_id: str, language: str) -> MultilingualASRRouterSession:
@@ -104,16 +107,16 @@ async def websocket_asr(websocket: WebSocket):
 
     print(f"[{session_id}] connected language={language}", flush=True)
 
-    await websocket.send_text(
-        json.dumps(
-            {
-                "type": "ready",
-                "session_id": session_id,
-                "language": language,
-                "sample_rate": SAMPLE_RATE,
-                "message": "WebSocket connected. Send config first, then PCM16 audio bytes.",
-            }
-        )
+    await send_payload(
+        websocket,
+        {
+            "type": "ready",
+            "session_id": session_id,
+            "language": language,
+            "sample_rate": SAMPLE_RATE,
+            "text": "",
+            "message": "WebSocket connected. Send config first, then PCM16 audio bytes.",
+        },
     )
 
     try:
@@ -128,14 +131,15 @@ async def websocket_asr(websocket: WebSocket):
                 try:
                     data = json.loads(message["text"])
                 except json.JSONDecodeError:
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "session_id": session_id,
-                                "message": "Invalid JSON message",
-                            }
-                        )
+                    await send_payload(
+                        websocket,
+                        {
+                            "type": "error",
+                            "session_id": session_id,
+                            "language": language,
+                            "text": "",
+                            "message": "Invalid JSON message",
+                        },
                     )
                     continue
 
@@ -145,15 +149,16 @@ async def websocket_asr(websocket: WebSocket):
                     requested_language = data.get("language", DEFAULT_LANGUAGE)
 
                     if requested_language not in SUPPORTED_LANGUAGES:
-                        await websocket.send_text(
-                            json.dumps(
-                                {
-                                    "type": "error",
-                                    "session_id": session_id,
-                                    "message": f"Unsupported language: {requested_language}",
-                                    "supported_languages": SUPPORTED_LANGUAGES,
-                                }
-                            )
+                        await send_payload(
+                            websocket,
+                            {
+                                "type": "error",
+                                "session_id": session_id,
+                                "language": language,
+                                "text": "",
+                                "message": f"Unsupported language: {requested_language}",
+                                "supported_languages": SUPPORTED_LANGUAGES,
+                            },
                         )
                         continue
 
@@ -161,46 +166,45 @@ async def websocket_asr(websocket: WebSocket):
 
                     print(f"[{session_id}] config language={language}", flush=True)
 
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "type": "loading",
-                                "session_id": session_id,
-                                "language": language,
-                                "message": "Loading ASR router, Silero VAD, and SpeechBrain LID",
-                            }
-                        )
+                    await send_payload(
+                        websocket,
+                        {
+                            "type": "loading",
+                            "session_id": session_id,
+                            "language": language,
+                            "text": "",
+                            "message": "Loading ASR router, Silero VAD, and SpeechBrain LID",
+                        },
                     )
 
                     router = create_router(session_id=session_id, language=language)
 
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "type": "config_ack",
-                                "session_id": session_id,
-                                "language": language,
-                                "sample_rate": SAMPLE_RATE,
-                            }
-                        )
+                    await send_payload(
+                        websocket,
+                        {
+                            "type": "config_ack",
+                            "session_id": session_id,
+                            "language": language,
+                            "sample_rate": SAMPLE_RATE,
+                            "text": "",
+                        },
                     )
 
                 elif msg_type == "end":
                     if router is None:
-                        await websocket.send_text(
-                            json.dumps(
-                                {
-                                    "type": "final",
-                                    "session_id": session_id,
-                                    "language": language,
-                                    "text": "",
-                                    "ttfb_ms": None,
-                                    "ttft_ms": None,
-                                    "elapsed_ms": None,
-                                    "asr_confidence": None,
-                                    "stream_end": True,
-                                }
-                            )
+                        await send_payload(
+                            websocket,
+                            {
+                                "type": "final",
+                                "session_id": session_id,
+                                "language": language,
+                                "text": "",
+                                "server_audio_received_ts_ms": None,
+                                "utterance_start_ts_ms": None,
+                                "server_elapsed_ms": None,
+                                "asr_confidence": None,
+                                "stream_end": True,
+                            },
                         )
                         break
 
@@ -217,7 +221,7 @@ async def websocket_asr(websocket: WebSocket):
                             final_text = output.text
                             payload["stream_end"] = True
 
-                        await websocket.send_text(json.dumps(payload))
+                        await send_payload(websocket, payload)
 
                     print(
                         f"[{session_id}] FINAL [{router.current_language}]: {final_text}",
@@ -227,50 +231,52 @@ async def websocket_asr(websocket: WebSocket):
                     break
 
                 elif msg_type == "ping":
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "type": "pong",
-                                "session_id": session_id,
-                            }
-                        )
+                    await send_payload(
+                        websocket,
+                        {
+                            "type": "pong",
+                            "session_id": session_id,
+                            "language": language,
+                            "text": "",
+                        },
                     )
 
                 else:
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "session_id": session_id,
-                                "message": f"Unsupported message type: {msg_type}",
-                            }
-                        )
+                    await send_payload(
+                        websocket,
+                        {
+                            "type": "error",
+                            "session_id": session_id,
+                            "language": language,
+                            "text": "",
+                            "message": f"Unsupported message type: {msg_type}",
+                        },
                     )
 
             elif "bytes" in message and message["bytes"] is not None:
                 if router is None:
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "type": "loading",
-                                "session_id": session_id,
-                                "language": language,
-                                "message": "Loading default ASR router",
-                            }
-                        )
+                    await send_payload(
+                        websocket,
+                        {
+                            "type": "loading",
+                            "session_id": session_id,
+                            "language": language,
+                            "text": "",
+                            "message": "Loading default ASR router",
+                        },
                     )
 
                     router = create_router(session_id=session_id, language=language)
 
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "type": "config_ack",
-                                "session_id": session_id,
-                                "language": language,
-                                "sample_rate": SAMPLE_RATE,
-                            }
-                        )
+                    await send_payload(
+                        websocket,
+                        {
+                            "type": "config_ack",
+                            "session_id": session_id,
+                            "language": language,
+                            "sample_rate": SAMPLE_RATE,
+                            "text": "",
+                        },
                     )
 
                 audio = pcm16_bytes_to_float32(message["bytes"])
@@ -285,20 +291,14 @@ async def websocket_asr(websocket: WebSocket):
                     if output.type == "audio_received":
                         print(
                             f"[{session_id}] AUDIO_RECEIVED "
-                            f"ttfb={payload.get('ttfb_ms')}ms "
-                            f"ttft={payload.get('ttft_ms')} "
-                            f"elapsed={payload.get('elapsed_ms')}ms",
+                            f"server_elapsed={payload.get('server_elapsed_ms')}ms",
                             flush=True,
                         )
 
                     elif output.type == "partial":
                         print(
                             f"[{session_id}] PARTIAL [{output.language}] "
-                            f"ttfb={payload.get('ttfb_ms')}ms "
-                            f"ttft={payload.get('ttft_ms')}ms "
-                            f"utterance_ttfb={payload.get('utterance_ttfb_ms')}ms "
-                            f"utterance_ttft={payload.get('utterance_ttft_ms')}ms "
-                            f"elapsed={payload.get('elapsed_ms')}ms "
+                            f"server_elapsed={payload.get('server_elapsed_ms')}ms "
                             f"asr_conf={payload.get('asr_confidence')} : {output.text}",
                             flush=True,
                         )
@@ -307,9 +307,7 @@ async def websocket_asr(websocket: WebSocket):
                         print(
                             f"[{session_id}] LANGUAGE_SWITCH "
                             f"{output.language} -> {output.detected_language} "
-                            f"ttfb={payload.get('ttfb_ms')}ms "
-                            f"ttft={payload.get('ttft_ms')}ms "
-                            f"elapsed={payload.get('elapsed_ms')}ms "
+                            f"server_elapsed={payload.get('server_elapsed_ms')}ms "
                             f"lid_conf={payload.get('lid_confidence')} "
                             f"lid_label={payload.get('lid_label')}",
                             flush=True,
@@ -318,17 +316,13 @@ async def websocket_asr(websocket: WebSocket):
                     elif output.type == "utterance_final":
                         print(
                             f"[{session_id}] UTTERANCE_FINAL [{output.language}] "
-                            f"ttfb={payload.get('ttfb_ms')}ms "
-                            f"ttft={payload.get('ttft_ms')}ms "
-                            f"utterance_ttfb={payload.get('utterance_ttfb_ms')}ms "
-                            f"utterance_ttft={payload.get('utterance_ttft_ms')}ms "
-                            f"elapsed={payload.get('elapsed_ms')}ms "
+                            f"server_elapsed={payload.get('server_elapsed_ms')}ms "
                             f"lid_conf={payload.get('lid_confidence')} "
                             f"lid_label={payload.get('lid_label')} : {output.text}",
                             flush=True,
                         )
 
-                    await websocket.send_text(json.dumps(payload))
+                    await send_payload(websocket, payload)
 
     except WebSocketDisconnect:
         print(f"[{session_id}] disconnected", flush=True)
@@ -338,30 +332,34 @@ async def websocket_asr(websocket: WebSocket):
             print(f"[{session_id}] disconnected cleanly", flush=True)
         else:
             print(f"[{session_id}] RUNTIME ERROR: {exc}", flush=True)
+
             try:
-                await websocket.send_text(
-                    json.dumps(
-                        {
-                            "type": "error",
-                            "session_id": session_id,
-                            "message": str(exc),
-                        }
-                    )
+                await send_payload(
+                    websocket,
+                    {
+                        "type": "error",
+                        "session_id": session_id,
+                        "language": language,
+                        "text": "",
+                        "message": str(exc),
+                    },
                 )
             except Exception:
                 pass
 
     except Exception as exc:
         print(f"[{session_id}] ERROR: {exc}", flush=True)
+
         try:
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "error",
-                        "session_id": session_id,
-                        "message": str(exc),
-                    }
-                )
+            await send_payload(
+                websocket,
+                {
+                    "type": "error",
+                    "session_id": session_id,
+                    "language": language,
+                    "text": "",
+                    "message": str(exc),
+                },
             )
         except Exception:
             pass
@@ -370,3 +368,6 @@ async def websocket_asr(websocket: WebSocket):
         print(f"[{session_id}] websocket closed", flush=True)
 
 
+@app.websocket("/asr/ml/ws")
+async def websocket_asr_ml(websocket: WebSocket):
+    await websocket_asr(websocket)
