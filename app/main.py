@@ -367,7 +367,3 @@ async def websocket_asr(websocket: WebSocket):
     finally:
         print(f"[{session_id}] websocket closed", flush=True)
 
-
-@app.websocket("/asr/ml/ws")
-async def websocket_asr_ml(websocket: WebSocket):
-    await websocket_asr(websocket)
