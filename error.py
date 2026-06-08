@@ -1,36 +1,11 @@
+websockets.exceptions.InvalidMessage: did not receive a valid HTTP response
 (venv) PS C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts> python .\nemotron_new_client.py --file C:\Users\re_nikitav\Downloads\audio_wav\Monologue.wav
-[warn] Health check failed: Remote end closed connection without response  (server may still be starting)
+[warn] Health check failed: HTTP Error 404: Not Found  (server may still be starting)
 [info] File: Monologue.wav
 [info] Audio: 16000Hz  1ch  16bit  124.7s
 [info] Language: en-US
 [info] Realtime simulation: False
-[info] Connecting to ws://localhost:8003/asr/realtime-custom-vad
-
-Traceback (most recent call last):
-  File "C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\http11.py", line 244, in parse
-    status_line = yield from parse_line(read_line)
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\http11.py", line 320, in parse_line
-    line = yield from read_line(MAX_LINE_LENGTH)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\streams.py", line 46, in read_line
-    raise EOFError(f"stream ends after {p} bytes, before end of line")
-EOFError: stream ends after 0 bytes, before end of line
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\client.py", line 303, in parse
-    response = yield from Response.parse(
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<3 lines>...
-    )
-    ^
-  File "C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\http11.py", line 246, in parse
-    raise EOFError("connection closed while reading HTTP status line") from exc
-EOFError: connection closed while reading HTTP status line
-
-The above exception was the direct cause of the following exception:
+[info] Connecting to ws://localhost:8002/asr/realtime-custom-vad
 
 Traceback (most recent call last):
   File "C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\nemotron_new_client.py", line 322, in <module>
@@ -67,5 +42,10 @@ Traceback (most recent call last):
     )
   File "C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\asyncio\client.py", line 115, in handshake
     raise self.protocol.handshake_exc
-websockets.exceptions.InvalidMessage: did not receive a valid HTTP response
-(venv) PS C:\Users\re_nikitav\De
+  File "C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\client.py", line 327, in parse
+    self.process_response(response)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\venv\Lib\site-packages\websockets\client.py", line 144, in process_response
+    raise InvalidStatus(response)
+websockets.exceptions.InvalidStatus: server rejected WebSocket connection: HTTP 403
+(venv) PS C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts>
