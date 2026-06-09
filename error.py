@@ -1,337 +1,572 @@
-from livekit.plugins import openai
-stt=openai.STT(
-        model="nemotron-3.5-asr-streaming-0.6b",
-        base_url="http://localhost:8000/v1",
-        api_key="unused",
-        language="es-US",   # or omit for auto-detect
-    )
-
-following this 
-and this is my current working client 
-
-        #!/usr/bin/env python3
-"""
-client.py — Test client for the Nemotron 3.5 ASR WebSocket server.
-
-Modes:
-  1. Microphone (real-time)  →  python client.py --mic
-  2. WAV file                →  python client.py --file audio.wav
-  3. WAV file (simulated RT) →  python client.py --file audio.wav --realtime
-
-Language:
-  --language en-US   (default)
-  --language es-US   (Spanish US)
-  --language auto    (model auto-detects)
-
-Usage examples:
-  python client.py --mic
-  python client.py --mic --language es-US
-  python client.py --file speech.wav
-  python client.py --file speech_es.wav --language es-US
-  python client.py --file speech.wav --realtime --language auto
-"""
-
-import argparse
 import asyncio
 import json
-import re
+import logging
+import os
+import subprocess
 import sys
-import time
-import wave
-from pathlib import Path
+import tempfile
+from typing import Optional
 
-import websockets
+import numpy as np
+import resampy
+from fastapi import FastAPI, WebSocket, UploadFile, File, Form
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SERVER_URL = "ws://35.254.200.29:8003/asr/realtime-custom-vad"
-SAMPLE_RATE = 16000
-CHUNK_MS = 100
-CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_MS / 1000) * 2   # int16 = 2 bytes/sample
-
-# ── ANSI colours ──────────────────────────────────────────────────────────────
-GREEN  = "\033[92m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-
-# ── Strip language tags like <en-US>, <es-US> that leak from model prompt ─────
-_LANG_TAG_RE = re.compile(r"<[a-z]{2}-[A-Z]{2}>\s*")
-
-def clean_text(text: str) -> str:
-    return _LANG_TAG_RE.sub("", text).strip()
+from app.config import load_config, Config, MODEL_MAP
+from app.factory import build_engine
+from app.streaming_session import StreamingSession
+from app.asr_engines.base import ASREngine
 
 
-def print_partial(text: str):
-    sys.stdout.write(f"\r{YELLOW}[partial]{RESET} {text}    ")
-    sys.stdout.flush()
+cfg = load_config()
+
+logging.basicConfig(
+    level=cfg.log_level,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+log = logging.getLogger("asr_server")
+
+app = FastAPI(
+    title="Nemotron 3.5 ASR Server",
+    version="1.0.0",
+)
+
+ENGINE_CACHE: dict[str, ASREngine] = {}
 
 
-def print_final(text: str, ttfb_ms):
-    ttfb_str = f"  {DIM}(TTFB {ttfb_ms}ms){RESET}" if ttfb_ms else ""
-    sys.stdout.write(f"\r{GREEN}{BOLD}[final]  {RESET}{GREEN}{text}{RESET}{ttfb_str}\n")
-    sys.stdout.flush()
+# ---------------------------------------------------------------------
+# Startup / Engine loading
+# ---------------------------------------------------------------------
+async def preload_engines():
+    log.info("Preloading ASR engines...")
+
+    for backend, model_name in MODEL_MAP.items():
+        try:
+            log.info(f"Initializing engine: {backend} ({model_name})")
+
+            tmp_cfg = Config()
+            object.__setattr__(tmp_cfg, "asr_backend", backend)
+            object.__setattr__(tmp_cfg, "model_name", model_name)
+            object.__setattr__(tmp_cfg, "device", cfg.device)
+            object.__setattr__(tmp_cfg, "sample_rate", cfg.sample_rate)
+
+            engine = build_engine(tmp_cfg)
+            load_sec = engine.load()
+
+            ENGINE_CACHE[backend] = engine
+
+            log.info(f"✅ Preloaded '{backend}' in {load_sec:.2f}s")
+
+        except Exception:
+            log.exception(f"Failed to preload '{backend}'")
+
+    log.info(f"All engines preloaded. Available: {list(ENGINE_CACHE.keys())}")
 
 
-def print_info(msg: str):
-    print(f"{CYAN}[info]{RESET} {msg}")
+@app.on_event("startup")
+async def startup_event():
+    log.info("Server startup initiated")
+    await preload_engines()
 
 
-# ── WebSocket receiver (runs concurrently) ────────────────────────────────────
-async def receive_loop(ws, stop_event: asyncio.Event):
-    """Print incoming transcript events until stop_event is set."""
+def get_engine(backend: str) -> ASREngine:
+    if backend not in ENGINE_CACHE:
+        raise ValueError(
+            f"Engine '{backend}' not loaded. Available: {list(ENGINE_CACHE.keys())}"
+        )
+    return ENGINE_CACHE[backend]
+
+
+# ---------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "Nemotron 3.5 ASR Server",
+        "websocket_endpoint": "/asr/realtime-custom-vad",
+        "openai_transcription_endpoint": "/v1/audio/transcriptions",
+    }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "engines": list(ENGINE_CACHE.keys()),
+        "device": cfg.device,
+        "sample_rate": cfg.sample_rate,
+    }
+
+
+# ---------------------------------------------------------------------
+# OpenAI-compatible helpers
+# ---------------------------------------------------------------------
+def convert_upload_to_pcm16_16k_mono(
+    input_bytes: bytes,
+    suffix: str = ".wav",
+) -> bytes:
+    """
+    Convert uploaded audio into raw PCM16 mono audio at cfg.sample_rate.
+
+    This supports WAV, MP3, M4A, FLAC, OGG, WEBM, etc., as long as ffmpeg
+    can decode it.
+
+    Output:
+        raw PCM bytes, not WAV container.
+    """
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as in_file:
+        in_file.write(input_bytes)
+        input_path = in_file.name
+
+    output_path = input_path + ".pcm"
+
     try:
-        async for raw in ws:
-            if isinstance(raw, bytes):
-                continue
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_path,
+            "-ac",
+            "1",
+            "-ar",
+            str(cfg.sample_rate),
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            output_path,
+        ]
 
-            ev_type = msg.get("type", "")
-            text    = clean_text(msg.get("text", ""))
-            ttfb    = msg.get("t_start")
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-            if ev_type == "done":
-                # Server confirmed EOF flush is complete
-                stop_event.set()
-                break
-            elif ev_type == "partial":
-                print_partial(text)
-            elif ev_type == "final":
-                print_final(text, ttfb)
-            elif ev_type == "error":
-                print(f"\n[server error] {text}")
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr}")
 
-    except websockets.exceptions.ConnectionClosedOK:
-        pass
-    except Exception as e:
-        print(f"\n[receive error] {e}")
+        with open(output_path, "rb") as f:
+            return f.read()
+
     finally:
-        stop_event.set()
+        try:
+            os.remove(input_path)
+        except FileNotFoundError:
+            pass
+
+        try:
+            os.remove(output_path)
+        except FileNotFoundError:
+            pass
 
 
-# ── Microphone mode ───────────────────────────────────────────────────────────
-async def run_mic(language: str, url: str):
+def normalize_language(language: Optional[str]) -> str:
+    """
+    Keep your server's language style.
+
+    Examples:
+        None   -> auto
+        ""     -> auto
+        auto   -> auto
+        en     -> en-US
+        es     -> es-US
+        en-US  -> en-US
+        es-US  -> es-US
+    """
+
+    if not language:
+        return "auto"
+
+    lang = language.strip()
+
+    if not lang:
+        return "auto"
+
+    low = lang.lower()
+
+    if low == "auto":
+        return "auto"
+
+    if low == "en":
+        return "en-US"
+
+    if low == "es":
+        return "es-US"
+
+    return lang
+
+
+def clean_model_leaked_tags(text: str) -> str:
+    """
+    Removes leaked prompt language tags like:
+        <en-US>
+        <es-US>
+    """
+
+    if not text:
+        return ""
+
+    import re
+
+    return re.sub(r"<[a-z]{2}-[A-Z]{2}>\s*", "", text).strip()
+
+
+async def run_pcm_through_session(
+    pcm_bytes: bytes,
+    engine: ASREngine,
+    language: str,
+    source: str = "openai-http",
+) -> str:
+    """
+    Runs raw PCM16 audio through the same StreamingSession used by WS mode.
+    Returns combined final transcript.
+    """
+
+    session = StreamingSession(engine, cfg)
+
+    final_texts: list[str] = []
+
+    chunk_ms = 100
+    chunk_bytes = int(cfg.sample_rate * chunk_ms / 1000) * 2
+
+    loop = asyncio.get_running_loop()
+
+    for i in range(0, len(pcm_bytes), chunk_bytes):
+        chunk = pcm_bytes[i : i + chunk_bytes]
+
+        if not chunk:
+            continue
+
+        events = await loop.run_in_executor(
+            None,
+            session.process_chunk,
+            chunk,
+        )
+
+        for ev_type, text, ttfb in events:
+            text = clean_model_leaked_tags(text)
+            _log_transcript(ev_type, text, ttfb, language, source)
+
+            if ev_type == "final" and text:
+                final_texts.append(text.strip())
+
+    # Flush final pending utterance
+    flush_events = await loop.run_in_executor(
+        None,
+        session.flush,
+    )
+
+    for ev_type, text, ttfb in flush_events:
+        text = clean_model_leaked_tags(text)
+        _log_transcript(ev_type, text, ttfb, language, source)
+
+        if ev_type == "final" and text:
+            final_texts.append(text.strip())
+
+    return " ".join(final_texts).strip()
+
+
+# ---------------------------------------------------------------------
+# OpenAI-compatible endpoints for LiveKit
+# ---------------------------------------------------------------------
+@app.get("/v1/models")
+async def list_openai_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "nemotron-3.5-asr-streaming-0.6b",
+                "object": "model",
+                "owned_by": "local",
+            }
+        ],
+    }
+
+
+@app.post("/v1/audio/transcriptions")
+async def openai_audio_transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form("nemotron-3.5-asr-streaming-0.6b"),
+    language: Optional[str] = Form("auto"),
+    response_format: Optional[str] = Form("json"),
+):
+    """
+    OpenAI-compatible transcription endpoint.
+
+    LiveKit openai.STT will call:
+
+        POST /v1/audio/transcriptions
+
+    Therefore LiveKit should use:
+
+        base_url="http://HOST:8003/v1"
+    """
+
+    lang = normalize_language(language)
+
+    log.info(
+        f"OpenAI-compatible STT request | model={model} language={lang} "
+        f"response_format={response_format} filename={file.filename}"
+    )
+
+    if model != "nemotron-3.5-asr-streaming-0.6b":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": f"Unsupported model: {model}",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
     try:
-        import sounddevice as sd
-    except ImportError:
-        print("sounddevice not installed. Run:  pip install sounddevice")
-        sys.exit(1)
+        engine = get_engine("nemotron")
+    except ValueError as e:
+        log.exception("Nemotron engine not available")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "server_error",
+                }
+            },
+        )
 
-    print_info(f"Connecting to {url}")
-    print_info(f"Language: {language}")
-    print_info("Speak into your microphone. Press Ctrl+C to stop.\n")
-
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({
-            "backend":     "nemotron",
-            "sample_rate": SAMPLE_RATE,
-            "language":    language,
-        }))
-
-        stop_event = asyncio.Event()
-        recv_task = asyncio.create_task(receive_loop(ws, stop_event))
-
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
-
-        def audio_callback(indata, frames, time_info, status):
-            import numpy as np
-            pcm = (indata[:, 0] * 32767).astype("int16").tobytes()
-            loop.call_soon_threadsafe(queue.put_nowait, pcm)
-
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=int(SAMPLE_RATE * CHUNK_MS / 1000),
-            callback=audio_callback,
-        ):
-            try:
-                while not stop_event.is_set():
-                    try:
-                        pcm = await asyncio.wait_for(queue.get(), timeout=0.5)
-                        await ws.send(pcm)
-                    except asyncio.TimeoutError:
-                        continue
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                print("\n")
-                print_info("Stopping...")
-
-        recv_task.cancel()
-        try:
-            await recv_task
-        except asyncio.CancelledError:
-            pass
-
-
-# ── WAV file mode ─────────────────────────────────────────────────────────────
-async def run_file(path: str, language: str, realtime: bool, url: str):
-    wav_path = Path(path)
-    if not wav_path.exists():
-        print(f"File not found: {path}")
-        sys.exit(1)
-
-    with wave.open(str(wav_path), "rb") as wf:
-        n_channels   = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        file_sr      = wf.getframerate()
-        n_frames     = wf.getnframes()
-        raw_audio    = wf.readframes(n_frames)
-
-    print_info(f"File: {wav_path.name}")
-    print_info(f"Audio: {file_sr}Hz  {n_channels}ch  {sample_width*8}bit  "
-               f"{n_frames/file_sr:.1f}s")
-    print_info(f"Language: {language}")
-    print_info(f"Realtime simulation: {realtime}")
-    print_info(f"Connecting to {url}\n")
-
-    import numpy as np
-    audio_i16 = np.frombuffer(raw_audio, dtype=np.int16)
-    if n_channels == 2:
-        audio_i16 = audio_i16.reshape(-1, 2).mean(axis=1).astype(np.int16)
-
-    if file_sr != SAMPLE_RATE:
-        print_info(f"Resampling {file_sr}Hz → {SAMPLE_RATE}Hz")
-        try:
-            import resampy
-        except ImportError:
-            print("resampy not installed. Run:  pip install resampy")
-            sys.exit(1)
-        audio_f32 = audio_i16.astype(np.float32) / 32768.0
-        audio_f32 = resampy.resample(audio_f32, file_sr, SAMPLE_RATE)
-        audio_i16 = (np.clip(audio_f32, -1.0, 1.0) * 32767).astype(np.int16)
-
-    raw_bytes = audio_i16.tobytes()
-    chunk_samples = int(SAMPLE_RATE * CHUNK_MS / 1000)
-    chunk_bytes   = chunk_samples * 2
-    chunks = [raw_bytes[i:i + chunk_bytes] for i in range(0, len(raw_bytes), chunk_bytes)]
-
-    t_start = time.time()
-
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({
-            "backend":     "nemotron",
-            "sample_rate": SAMPLE_RATE,
-            "language":    language,
-        }))
-
-        stop_event = asyncio.Event()
-        recv_task  = asyncio.create_task(receive_loop(ws, stop_event))
-
-        try:
-            for i, chunk in enumerate(chunks):
-                await ws.send(chunk)
-
-                if realtime:
-                    expected_elapsed = (i + 1) * CHUNK_MS / 1000.0
-                    actual_elapsed   = time.time() - t_start
-                    sleep_for = expected_elapsed - actual_elapsed
-                    if sleep_for > 0:
-                        await asyncio.sleep(sleep_for)
-                else:
-                    await asyncio.sleep(0.001)
-
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
-
-        # Send EOF so server flushes the last in-progress utterance
-        print_info("\nAll audio sent — sending EOF signal...")
-        await ws.send(json.dumps({"type": "eof"}))
-
-        # Wait for server to reply with {"type": "done"}
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=15.0)
-        except asyncio.TimeoutError:
-            print_info("Timeout waiting for server — last utterance may be incomplete")
-
-        recv_task.cancel()
-        try:
-            await recv_task
-        except asyncio.CancelledError:
-            pass
-
-    elapsed = time.time() - t_start
-    audio_sec = len(audio_i16) / SAMPLE_RATE
-    rtf = elapsed / audio_sec if audio_sec > 0 else 0
-    print_info(f"\nDone. Audio={audio_sec:.1f}s  Wall={elapsed:.2f}s  RTF={rtf:.2f}x")
-
-
-# ── Health check ──────────────────────────────────────────────────────────────
-async def check_health(host: str = "http://localhost:8002"):
     try:
-        import urllib.request
-        with urllib.request.urlopen(f"{host}/health", timeout=3) as r:
-            data = json.loads(r.read())
-        print_info(f"Server health: {data}")
-        return True
+        engine.set_language(lang)
+
+        audio_bytes = await file.read()
+
+        suffix = ".wav"
+        if file.filename and "." in file.filename:
+            suffix = "." + file.filename.rsplit(".", 1)[-1]
+
+        pcm_bytes = convert_upload_to_pcm16_16k_mono(
+            input_bytes=audio_bytes,
+            suffix=suffix,
+        )
+
+        transcript = await run_pcm_through_session(
+            pcm_bytes=pcm_bytes,
+            engine=engine,
+            language=lang,
+            source="openai-http",
+        )
+
+        if response_format == "text":
+            return PlainTextResponse(transcript)
+
+        if response_format == "verbose_json":
+            return {
+                "task": "transcribe",
+                "language": lang,
+                "duration": None,
+                "text": transcript,
+                "segments": [],
+            }
+
+        return {
+            "text": transcript,
+        }
+
     except Exception as e:
-        print(f"[warn] Health check failed: {e}  (server may still be starting)")
-        return False
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        description="Nemotron 3.5 ASR WebSocket test client",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--mic",  action="store_true", help="Use microphone input")
-    mode.add_argument("--file", metavar="PATH",      help="Transcribe a WAV file")
-
-    parser.add_argument(
-        "--language",
-        default="en-US",
-        help=(
-            "Language locale. Examples: en-US, en-GB, es-US, es-ES, "
-            "fr-FR, de-DE, hi-IN, ja-JP, auto. Default: en-US"
-        ),
-    )
-    parser.add_argument(
-        "--realtime",
-        action="store_true",
-        help="(file mode) Simulate real-time pacing",
-    )
-    parser.add_argument(
-        "--url",
-        default=SERVER_URL,
-        help=f"WebSocket URL. Default: {SERVER_URL}",
-    )
-    parser.add_argument(
-        "--health",
-        action="store_true",
-        help="Just check server health and exit",
-    )
-
-    args = parser.parse_args()
-
-    http_host = args.url.replace("ws://", "http://").replace("wss://", "https://")
-    http_host = http_host.rsplit("/", 1)[0]
-
-    if args.health:
-        asyncio.run(check_health(http_host))
-        return
-
-    asyncio.run(check_health(http_host))
-
-    if args.mic:
-        asyncio.run(run_mic(language=args.language, url=args.url))
-    else:
-        asyncio.run(
-            run_file(
-                path=args.file,
-                language=args.language,
-                realtime=args.realtime,
-                url=args.url,
-            )
+        log.exception("OpenAI-compatible transcription failed")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "server_error",
+                }
+            },
         )
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------
+# Existing WebSocket ASR endpoint
+# ---------------------------------------------------------------------
+@app.websocket("/asr/realtime-custom-vad")
+async def ws_asr(ws: WebSocket):
+    log.info(f"WS connection request from {ws.client}")
+    await ws.accept()
+
+    try:
+        raw_init = await ws.receive_text()
+        init = json.loads(raw_init)
+    except Exception as e:
+        log.warning(f"Bad init message: {e}")
+        await ws.close(code=4001)
+        return
+
+    backend = init.get("backend", "nemotron")
+    client_sample_rate = int(init.get("sample_rate", cfg.sample_rate))
+
+    language = init.get("language")
+    if not language:
+        log.warning(
+            f"Client {ws.client} did not send 'language' — defaulting to 'auto'"
+        )
+        language = "auto"
+
+    language = normalize_language(language)
+
+    if backend not in MODEL_MAP:
+        log.warning(f"Invalid backend requested: '{backend}'")
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "error",
+                    "text": f"Unknown backend '{backend}'",
+                }
+            )
+        )
+        await ws.close(code=4000)
+        return
+
+    try:
+        engine = get_engine(backend)
+    except ValueError as e:
+        log.error(str(e))
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "error",
+                    "text": str(e),
+                }
+            )
+        )
+        await ws.close(code=4000)
+        return
+
+    engine.set_language(language)
+
+    log.info(
+        f"WS connected | backend={backend} language={language} "
+        f"client_sr={client_sample_rate} server_sr={cfg.sample_rate} "
+        f"client={ws.client}"
+    )
+
+    def upsample_if_needed(pcm: bytes) -> bytes:
+        if not pcm:
+            return pcm
+
+        if client_sample_rate == cfg.sample_rate:
+            return pcm
+
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        y = resampy.resample(x, client_sample_rate, cfg.sample_rate)
+        y = np.clip(y, -1.0, 1.0)
+
+        return (y * 32767.0).astype(np.int16).tobytes()
+
+    session = StreamingSession(engine, cfg)
+
+    try:
+        while True:
+            msg = await ws.receive()
+
+            if msg["type"] == "websocket.disconnect":
+                log.info(f"Client disconnected: {ws.client}")
+                break
+
+            # Text frame: EOF signal {"type": "eof"}
+            if msg.get("text"):
+                try:
+                    ctrl = json.loads(msg["text"])
+
+                    if ctrl.get("type") == "eof":
+                        log.info(f"EOF from {ws.client} — flushing last utterance")
+
+                        loop = asyncio.get_running_loop()
+                        events = await loop.run_in_executor(
+                            None,
+                            session.flush,
+                        )
+
+                        for ev_type, text, ttfb in events:
+                            text = clean_model_leaked_tags(text)
+                            _log_transcript(
+                                ev_type,
+                                text,
+                                ttfb,
+                                language,
+                                ws.client,
+                            )
+
+                            await ws.send_text(
+                                json.dumps(
+                                    {
+                                        "type": ev_type,
+                                        "text": text,
+                                        "t_start": ttfb,
+                                    }
+                                )
+                            )
+
+                        await ws.send_text(json.dumps({"type": "done"}))
+
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+                continue
+
+            data = msg.get("bytes")
+
+            if data is None:
+                continue
+
+            data = upsample_if_needed(data)
+
+            loop = asyncio.get_running_loop()
+            events = await loop.run_in_executor(
+                None,
+                session.process_chunk,
+                data,
+            )
+
+            for ev_type, text, ttfb in events:
+                text = clean_model_leaked_tags(text)
+                _log_transcript(
+                    ev_type,
+                    text,
+                    ttfb,
+                    language,
+                    ws.client,
+                )
+
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "type": ev_type,
+                            "text": text,
+                            "t_start": ttfb,
+                        }
+                    )
+                )
+
+    except Exception:
+        log.exception(f"Error during WebSocket session for {ws.client}")
+
+    finally:
+        log.info(f"WS session closed for {ws.client}")
+
+
+def _log_transcript(ev_type: str, text: str, ttfb_ms, language: str, client):
+    if not text:
+        return
+
+    if ev_type == "partial":
+        log.debug(f"PARTIAL | lang={language} client={client} | {text}")
+
+    elif ev_type == "final":
+        ttfb_str = f" ttfb={ttfb_ms}ms" if ttfb_ms is not None else ""
+        log.info(f"FINAL   | lang={language} client={client}{ttfb_str} | {text}")
