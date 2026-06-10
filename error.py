@@ -786,7 +786,60 @@ if __name__ == "__main__":
     main()
 
 
-(nemo_env) root@cx-asr-test:/home/nikita_verma2/nemotron_asr# tail nemotron_benchmark.log 
+(nemo_env) root@cx-asr-test:/home/nikita_verma2/nemotron_asr# tail --200 nemotron_benchmark.log 
+tail: unrecognized option '--200'
+Try 'tail --help' for more information.
+(nemo_env) root@cx-asr-test:/home/nikita_verma2/nemotron_asr# tail -200 nemotron_benchmark.log 
+nohup: ignoring input
+
+Downloading maria*.mp3 audios...
+[cmd] gcloud storage cp gs://cx-asr-test-data/audios/maria*.mp3 benchmark_workspace/audios
+
+Downloading maria*_reference.txt references...
+[cmd] gcloud storage cp gs://cx-asr-test-data/references/maria*_reference.txt benchmark_workspace/references
+
+Found 15 maria audio files.
+
+================================================================================
+[1/15] Benchmarking: maria1.mp3
+================================================================================
+Reference: maria1_reference.txt
+[cmd] ffmpeg -y -i benchmark_workspace/audios/maria1.mp3 -ac 1 -ar 16000 -sample_fmt s16 benchmark_workspace/wav_16k/maria1.wav
+WER=33.58% CER=24.96% SER=100.00%
+Saved: benchmark_workspace/results/nemotron_3.5/maria1_latencies.json
+Saved: benchmark_workspace/results/nemotron_3.5/maria1_transcript.txt
+
+================================================================================
+[2/15] Benchmarking: maria10.mp3
+================================================================================
+Reference: maria10_reference.txt
+[cmd] ffmpeg -y -i benchmark_workspace/audios/maria10.mp3 -ac 1 -ar 16000 -sample_fmt s16 benchmark_workspace/wav_16k/maria10.wav
+WER=78.83% CER=74.48% SER=100.00%
+Saved: benchmark_workspace/results/nemotron_3.5/maria10_latencies.json
+Saved: benchmark_workspace/results/nemotron_3.5/maria10_transcript.txt
+
+================================================================================
+[3/15] Benchmarking: maria16.mp3
+================================================================================
+Reference: maria16_reference.txt
+[cmd] ffmpeg -y -i benchmark_workspace/audios/maria16.mp3 -ac 1 -ar 16000 -sample_fmt s16 benchmark_workspace/wav_16k/maria16.wav
+Traceback (most recent call last):
+  File "/home/nikita_verma2/nemotron_asr/benchmark_maria_nemotron.py", line 786, in <module>
+    main()
+  File "/home/nikita_verma2/nemotron_asr/benchmark_maria_nemotron.py", line 782, in main
+    asyncio.run(run_benchmark(args))
+  File "/usr/lib/python3.11/asyncio/runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/base_events.py", line 653, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/home/nikita_verma2/nemotron_asr/benchmark_maria_nemotron.py", line 673, in run_benchmark
+    benchmark = await benchmark_one_audio(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/home/nikita_verma2/nemotron_asr/benchmark_maria_nemotron.py", line 495, in benchmark_one_audio
     await ws.send(chunk)
   File "/home/nikita_verma2/nemotron_asr/nemo_env/lib/python3.11/site-packages/websockets/asyncio/connection.py", line 485, in send
