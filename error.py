@@ -4,25 +4,25 @@ benchmark_maria_nemotron.py
 
 Benchmarks Nemotron 3.5 ASR WebSocket server on maria*.mp3 files from GCS.
 
-Input:
+Inputs:
   gs://cx-asr-test-data/audios/maria*.mp3
   gs://cx-asr-test-data/references/maria*_reference.txt
 
-Output per audio:
+Outputs per original audio:
   maria*_latencies.json
   maria*_transcript.txt
 
-If one audio fails:
+If an audio fails:
   maria*_error.json
 
-Upload output to:
+Uploads to:
   gs://cx-asr-test-data/results/nemotron_3.5/
 
 Recommended run:
-  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600 > nemotron_benchmark.log 2>&1 &
+  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --segment-seconds 300 --receive-timeout 1200 > nemotron_benchmark_full.log 2>&1 &
 
 Resume without re-downloading:
-  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600 --no-download > nemotron_benchmark_resume.log 2>&1 &
+  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --segment-seconds 300 --receive-timeout 1200 --no-download > nemotron_benchmark_resume.log 2>&1 &
 """
 
 import argparse
@@ -61,6 +61,7 @@ WORK_DIR = Path("benchmark_workspace")
 AUDIO_DIR = WORK_DIR / "audios"
 REF_DIR = WORK_DIR / "references"
 WAV_DIR = WORK_DIR / "wav_16k"
+SEGMENT_DIR = WORK_DIR / "segments_16k"
 OUT_DIR = WORK_DIR / "results" / "nemotron_3.5"
 
 _LANG_TAG_RE = re.compile(r"<[a-z]{2}-[A-Z]{2}>\s*")
@@ -72,12 +73,11 @@ _LANG_TAG_RE = re.compile(r"<[a-z]{2}-[A-Z]{2}>\s*")
 def clean_text(text: str) -> str:
     if not text:
         return ""
-
     return _LANG_TAG_RE.sub("", text).strip()
 
 
 def ensure_dirs():
-    for d in [AUDIO_DIR, REF_DIR, WAV_DIR, OUT_DIR]:
+    for d in [AUDIO_DIR, REF_DIR, WAV_DIR, SEGMENT_DIR, OUT_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -94,29 +94,21 @@ def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
     if check and result.returncode != 0:
         if result.stdout:
             print(result.stdout, flush=True)
-
         if result.stderr:
             print(result.stderr, file=sys.stderr, flush=True)
-
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
 
     return result
 
 
 def find_storage_cli() -> str:
-    """
-    Prefer gcloud storage. Fallback to gsutil.
-    """
-
     if shutil.which("gcloud"):
         return "gcloud"
 
     if shutil.which("gsutil"):
         return "gsutil"
 
-    raise RuntimeError(
-        "Neither gcloud nor gsutil found. Install Google Cloud SDK first."
-    )
+    raise RuntimeError("Neither gcloud nor gsutil found. Install Google Cloud SDK first.")
 
 
 def gcs_cp_many(src_pattern: str, dst_dir: Path):
@@ -161,27 +153,16 @@ def download_inputs():
     gcs_cp_many(f"{REFERENCE_GCS}/maria*_reference.txt", REF_DIR)
 
 
-def convert_mp3_to_wav_16k_mono(mp3_path: Path) -> Path:
-    wav_path = WAV_DIR / f"{mp3_path.stem}.wav"
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(mp3_path),
-        "-ac",
-        "1",
-        "-ar",
-        str(SAMPLE_RATE),
-        "-sample_fmt",
-        "s16",
-        str(wav_path),
+def natural_key(path: Path):
+    return [
+        int(x) if x.isdigit() else x.lower()
+        for x in re.split(r"(\d+)", path.name)
     ]
 
-    run_cmd(cmd)
-    return wav_path
 
-
+# ---------------------------------------------------------------------
+# Audio helpers
+# ---------------------------------------------------------------------
 def read_wav_pcm16(wav_path: Path) -> Tuple[bytes, float]:
     with wave.open(str(wav_path), "rb") as wf:
         n_channels = wf.getnchannels()
@@ -199,38 +180,88 @@ def read_wav_pcm16(wav_path: Path) -> Tuple[bytes, float]:
         audio_i16 = audio_i16.reshape(-1, 2).mean(axis=1).astype(np.int16)
 
     if file_sr != SAMPLE_RATE:
-        raise ValueError(
-            f"{wav_path} sample rate is {file_sr}, expected {SAMPLE_RATE}"
-        )
+        raise ValueError(f"{wav_path} sample rate is {file_sr}, expected {SAMPLE_RATE}")
 
     audio_duration_sec = len(audio_i16) / SAMPLE_RATE
     return audio_i16.tobytes(), audio_duration_sec
 
 
-def natural_key(path: Path):
+def split_mp3_to_wav_segments(
+    mp3_path: Path,
+    segment_seconds: int,
+    force_split: bool = False,
+) -> List[Path]:
     """
-    Makes maria1, maria2, maria10 sort naturally.
+    Split one MP3 into 16kHz mono PCM16 WAV segments.
+
+    For any audio duration:
+      5 min audio       -> 1 segment if segment_seconds=300 or 600
+      45 min audio      -> multiple segments
+      2 hr 41 min audio -> many segments
+
+    All segments are later transcribed and combined into one final transcript.
     """
 
-    return [
-        int(x) if x.isdigit() else x.lower()
-        for x in re.split(r"(\d+)", path.name)
+    per_audio_segment_dir = SEGMENT_DIR / mp3_path.stem
+    per_audio_segment_dir.mkdir(parents=True, exist_ok=True)
+
+    pattern = per_audio_segment_dir / f"{mp3_path.stem}_part_%04d.wav"
+
+    existing_segments = sorted(
+        per_audio_segment_dir.glob(f"{mp3_path.stem}_part_*.wav"),
+        key=natural_key,
+    )
+
+    if existing_segments and not force_split:
+        print(
+            f"[info] Using existing {len(existing_segments)} segments for {mp3_path.name}",
+            flush=True,
+        )
+        return existing_segments
+
+    for old_file in existing_segments:
+        try:
+            old_file.unlink()
+        except FileNotFoundError:
+            pass
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(mp3_path),
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-sample_fmt",
+        "s16",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(segment_seconds),
+        "-reset_timestamps",
+        "1",
+        str(pattern),
     ]
+
+    run_cmd(cmd)
+
+    segment_paths = sorted(
+        per_audio_segment_dir.glob(f"{mp3_path.stem}_part_*.wav"),
+        key=natural_key,
+    )
+
+    if not segment_paths:
+        raise RuntimeError(f"No segments created for {mp3_path}")
+
+    return segment_paths
 
 
 # ---------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------
 def normalize_for_metrics(text: str) -> str:
-    """
-    Normalize multilingual transcript text for WER/CER/SER.
-
-    - lowercases
-    - converts underscores to spaces
-    - removes punctuation
-    - keeps accented characters
-    """
-
     if not text:
         return ""
 
@@ -244,11 +275,6 @@ def normalize_for_metrics(text: str) -> str:
 
 
 def levenshtein_distance(a: List[str], b: List[str]) -> int:
-    """
-    Memory-efficient Levenshtein distance.
-    Works for words or characters.
-    """
-
     if len(a) < len(b):
         a, b = b, a
 
@@ -288,9 +314,7 @@ def calculate_wer_cer_ser(reference_text: str, hypothesis_text: str) -> Dict:
     ref_lines = [x.strip() for x in reference_text.splitlines() if x.strip()]
     hyp_lines = [x.strip() for x in hypothesis_text.splitlines() if x.strip()]
 
-    # IMPORTANT:
-    # If reference is one continuous paragraph, SER is not meaningful.
-    # So we return null instead of misleading 100%.
+    # If reference is one paragraph, SER is not meaningful.
     if len(ref_lines) <= 1:
         sentence_errors = None
         sentence_count = len(ref_lines)
@@ -329,17 +353,18 @@ def calculate_wer_cer_ser(reference_text: str, hypothesis_text: str) -> Dict:
 
 
 # ---------------------------------------------------------------------
-# WebSocket benchmarking
+# Single-segment WebSocket transcription
 # ---------------------------------------------------------------------
-async def benchmark_one_audio(
+async def benchmark_one_segment(
     wav_path: Path,
     original_audio_path: Path,
-    reference_path: Optional[Path],
     language: str,
     url: str,
     realtime: bool,
     receive_timeout_sec: float,
     fast_sleep_sec: float,
+    segment_idx: int,
+    segment_count: int,
 ) -> Dict:
     raw_bytes, audio_duration_sec = read_wav_pcm16(wav_path)
 
@@ -356,8 +381,7 @@ async def benchmark_one_audio(
 
     connection_start = time.time()
 
-    # Disable client-side ping timeout to avoid:
-    # keepalive ping timeout; no close frame received
+    # Disable client ping timeout so long ASR processing does not kill connection.
     async with websockets.connect(
         url,
         ping_interval=None,
@@ -418,17 +442,16 @@ async def benchmark_one_audio(
                         response_events.append(
                             {
                                 "response_num": response_num,
+                                "segment_idx": segment_idx,
+                                "segment_count": segment_count,
+                                "segment_file": str(wav_path),
                                 "type": "error",
                                 "text": text,
                                 "timestamp": datetime.now().isoformat(),
                                 "server_session_id": server_session_id,
                                 "server_timestamp_utc": server_timestamp_utc,
-                                "latency_from_start_ms": (
-                                    now - connection_start
-                                ) * 1000,
-                                "latency_from_send_start_ms": (
-                                    now - send_start
-                                ) * 1000,
+                                "latency_from_start_ms": (now - connection_start) * 1000,
+                                "latency_from_send_start_ms": (now - send_start) * 1000,
                                 "latency_from_first_chunk_ms": (
                                     (now - first_chunk_sent_at) * 1000
                                     if first_chunk_sent_at
@@ -464,13 +487,12 @@ async def benchmark_one_audio(
                     response_events.append(
                         {
                             "response_num": response_num,
+                            "segment_idx": segment_idx,
+                            "segment_count": segment_count,
+                            "segment_file": str(wav_path),
                             "type": ev_type,
-                            "latency_from_start_ms": (
-                                now - connection_start
-                            ) * 1000,
-                            "latency_from_send_start_ms": (
-                                now - send_start
-                            ) * 1000,
+                            "latency_from_start_ms": (now - connection_start) * 1000,
+                            "latency_from_send_start_ms": (now - send_start) * 1000,
                             "latency_from_first_chunk_ms": (
                                 (now - first_chunk_sent_at) * 1000
                                 if first_chunk_sent_at
@@ -496,6 +518,9 @@ async def benchmark_one_audio(
                 response_events.append(
                     {
                         "response_num": len(response_events) + 1,
+                        "segment_idx": segment_idx,
+                        "segment_count": segment_count,
+                        "segment_file": str(wav_path),
                         "type": "client_receive_error",
                         "text": str(e),
                         "timestamp": datetime.now().isoformat(),
@@ -508,6 +533,12 @@ async def benchmark_one_audio(
                 done_event.set()
 
         recv_task = asyncio.create_task(receiver())
+
+        print(
+            f"Sending segment {segment_idx}/{segment_count} "
+            f"duration={audio_duration_sec:.2f}s chunks={len(chunks)} realtime={realtime}",
+            flush=True,
+        )
 
         for i, chunk in enumerate(chunks):
             if first_chunk_sent_at is None:
@@ -530,14 +561,16 @@ async def benchmark_one_audio(
 
         await ws.send(json.dumps({"type": "eof"}))
 
+        # Dynamic timeout:
+        # For 5-10 min segment, wait enough for EOF flush.
+        dynamic_timeout = max(receive_timeout_sec, audio_duration_sec + 600)
+
         try:
-            await asyncio.wait_for(
-                done_event.wait(),
-                timeout=receive_timeout_sec,
-            )
+            await asyncio.wait_for(done_event.wait(), timeout=dynamic_timeout)
         except asyncio.TimeoutError:
             print(
-                f"[warn] Timeout waiting for done event after EOF: {wav_path.name}",
+                f"[warn] Timeout waiting for done after EOF: "
+                f"{wav_path.name} timeout={dynamic_timeout}s",
                 flush=True,
             )
 
@@ -550,59 +583,40 @@ async def benchmark_one_audio(
 
     total_processing_time_sec = time.time() - connection_start
 
-    # IMPORTANT:
-    # Transcript is one continuous paragraph to match your reference format.
     transcript = " ".join(t.strip() for t in final_texts if t.strip())
     transcript = re.sub(r"\s+", " ", transcript).strip()
 
     first_response = response_events[0] if response_events else None
     first_final = next((x for x in response_events if x.get("is_final")), None)
 
-    first_response_latency_sec = (
-        first_response["latency_from_start_ms"] / 1000
-        if first_response
-        else None
-    )
-
-    first_final_latency_sec = (
-        first_final["latency_from_start_ms"] / 1000
-        if first_final
-        else None
-    )
-
-    first_byte_latency_sec = first_response_latency_sec
-
     timing_metrics = {
         "connection_time_sec": connection_time_sec,
         "send_duration_sec": send_duration_sec,
-        "first_byte_latency_sec": first_byte_latency_sec,
-        "first_response_latency_sec": first_response_latency_sec,
-        "first_final_latency_sec": first_final_latency_sec,
-        "time_to_first_chunk_sec": (
-            first_chunk_sent_at - connection_start
-            if first_chunk_sent_at
+        "first_byte_latency_sec": (
+            first_response["latency_from_start_ms"] / 1000
+            if first_response
             else None
+        ),
+        "first_response_latency_sec": (
+            first_response["latency_from_start_ms"] / 1000
+            if first_response
+            else None
+        ),
+        "first_final_latency_sec": (
+            first_final["latency_from_start_ms"] / 1000
+            if first_final
+            else None
+        ),
+        "time_to_first_chunk_sec": (
+            first_chunk_sent_at - connection_start if first_chunk_sent_at else None
         ),
     }
 
-    reference_text = ""
-    accuracy_metrics = None
-
-    if reference_path and reference_path.exists():
-        reference_text = reference_path.read_text(
-            encoding="utf-8",
-            errors="ignore",
-        )
-
-        accuracy_metrics = calculate_wer_cer_ser(
-            reference_text=reference_text,
-            hypothesis_text=transcript,
-        )
-
     result = {
         "audio_file": str(original_audio_path),
-        "converted_wav_file": str(wav_path),
-        "reference_file": str(reference_path) if reference_path else None,
+        "segment_file": str(wav_path),
+        "segment_idx": segment_idx,
+        "segment_count": segment_count,
         "audio_duration_sec": audio_duration_sec,
         "total_processing_time_sec": total_processing_time_sec,
         "rtf": (
@@ -620,12 +634,160 @@ async def benchmark_one_audio(
             "partial_count": partial_count,
             "final_count": final_count,
             "total_response_count": len(response_events),
+            "transcript_words": len(transcript.split()),
+            "transcript_chars": len(transcript),
+        },
+        "latencies": response_events,
+    }
+
+    return {
+        "result": result,
+        "transcript": transcript,
+    }
+
+
+# ---------------------------------------------------------------------
+# Full original audio benchmark using segments
+# ---------------------------------------------------------------------
+async def benchmark_segmented_audio(
+    segment_paths: List[Path],
+    original_audio_path: Path,
+    reference_path: Optional[Path],
+    language: str,
+    url: str,
+    realtime: bool,
+    receive_timeout_sec: float,
+    fast_sleep_sec: float,
+) -> Dict:
+    all_latencies = []
+    all_transcript_parts = []
+    segment_summaries = []
+
+    total_audio_duration_sec = 0.0
+    total_processing_time_sec = 0.0
+
+    segment_count = len(segment_paths)
+
+    for segment_idx, wav_path in enumerate(segment_paths, start=1):
+        print(
+            f"\nTranscribing segment {segment_idx}/{segment_count}: {wav_path.name}",
+            flush=True,
+        )
+
+        segment_start = time.time()
+
+        segment_benchmark = await benchmark_one_segment(
+            wav_path=wav_path,
+            original_audio_path=original_audio_path,
+            language=language,
+            url=url,
+            realtime=realtime,
+            receive_timeout_sec=receive_timeout_sec,
+            fast_sleep_sec=fast_sleep_sec,
+            segment_idx=segment_idx,
+            segment_count=segment_count,
+        )
+
+        segment_processing_time_sec = time.time() - segment_start
+
+        segment_result = segment_benchmark["result"]
+        segment_transcript = segment_benchmark["transcript"].strip()
+
+        if segment_transcript:
+            all_transcript_parts.append(segment_transcript)
+
+        segment_latencies = segment_result["latencies"]
+        all_latencies.extend(segment_latencies)
+
+        total_audio_duration_sec += segment_result["audio_duration_sec"]
+        total_processing_time_sec += segment_processing_time_sec
+
+        segment_summaries.append(
+            {
+                "segment_idx": segment_idx,
+                "segment_file": str(wav_path),
+                "audio_duration_sec": segment_result["audio_duration_sec"],
+                "processing_time_sec": segment_processing_time_sec,
+                "rtf": (
+                    segment_processing_time_sec / segment_result["audio_duration_sec"]
+                    if segment_result["audio_duration_sec"] > 0
+                    else None
+                ),
+                "final_count": segment_result["summary"]["final_count"],
+                "partial_count": segment_result["summary"]["partial_count"],
+                "total_response_count": segment_result["summary"]["total_response_count"],
+                "transcript_words": len(segment_transcript.split()),
+                "transcript_chars": len(segment_transcript),
+            }
+        )
+
+    # Match your reference format: one continuous paragraph.
+    transcript = " ".join(x.strip() for x in all_transcript_parts if x.strip())
+    transcript = re.sub(r"\s+", " ", transcript).strip()
+
+    reference_text = ""
+    accuracy_metrics = None
+
+    if reference_path and reference_path.exists():
+        reference_text = reference_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+
+        accuracy_metrics = calculate_wer_cer_ser(
+            reference_text=reference_text,
+            hypothesis_text=transcript,
+        )
+
+    first_response = all_latencies[0] if all_latencies else None
+    first_final = next((x for x in all_latencies if x.get("is_final")), None)
+
+    result = {
+        "audio_file": str(original_audio_path),
+        "reference_file": str(reference_path) if reference_path else None,
+        "audio_duration_sec": total_audio_duration_sec,
+        "total_processing_time_sec": total_processing_time_sec,
+        "rtf": (
+            total_processing_time_sec / total_audio_duration_sec
+            if total_audio_duration_sec > 0
+            else None
+        ),
+        "timestamp": datetime.now().isoformat(),
+        "model": MODEL_NAME,
+        "language": language,
+        "server_url": url,
+        "realtime": realtime,
+        "segmented": True,
+        "segment_count": segment_count,
+        "timing_metrics": {
+            "first_byte_latency_sec": (
+                first_response["latency_from_start_ms"] / 1000
+                if first_response
+                else None
+            ),
+            "first_response_latency_sec": (
+                first_response["latency_from_start_ms"] / 1000
+                if first_response
+                else None
+            ),
+            "first_final_latency_sec": (
+                first_final["latency_from_start_ms"] / 1000
+                if first_final
+                else None
+            ),
+        },
+        "summary": {
+            "segment_count": segment_count,
+            "total_response_count": len(all_latencies),
+            "final_count": sum(1 for x in all_latencies if x.get("is_final")),
+            "partial_count": sum(1 for x in all_latencies if x.get("type") == "partial"),
             "transcript_lines": 1 if transcript else 0,
             "transcript_words": len(transcript.split()),
             "transcript_chars": len(transcript),
         },
+        "segment_summaries": segment_summaries,
         "accuracy_metrics": accuracy_metrics,
-        "latencies": response_events,
+        "latencies": all_latencies,
     }
 
     return {
@@ -639,10 +801,6 @@ async def benchmark_one_audio(
 # File matching
 # ---------------------------------------------------------------------
 def find_reference_for_audio(audio_path: Path) -> Optional[Path]:
-    """
-    maria1.mp3 -> maria1_reference.txt
-    """
-
     candidates = [
         REF_DIR / f"{audio_path.stem}_reference.txt",
         REF_DIR / f"{audio_path.stem}_reference.text",
@@ -712,10 +870,19 @@ async def run_benchmark(args):
             continue
 
         try:
-            wav_path = convert_mp3_to_wav_16k_mono(audio_path)
+            segment_paths = split_mp3_to_wav_segments(
+                mp3_path=audio_path,
+                segment_seconds=args.segment_seconds,
+                force_split=args.force_split,
+            )
 
-            benchmark = await benchmark_one_audio(
-                wav_path=wav_path,
+            print(
+                f"Created/found {len(segment_paths)} segments for {audio_path.name}",
+                flush=True,
+            )
+
+            benchmark = await benchmark_segmented_audio(
+                segment_paths=segment_paths,
                 original_audio_path=audio_path,
                 reference_path=reference_path,
                 language=args.language,
@@ -775,16 +942,13 @@ async def run_benchmark(args):
                 "model": MODEL_NAME,
                 "language": args.language,
                 "server_url": args.url,
+                "segment_seconds": args.segment_seconds,
                 "error": repr(e),
                 "status": "failed",
             }
 
             error_out.write_text(
-                json.dumps(
-                    error_payload,
-                    indent=2,
-                    ensure_ascii=False,
-                ),
+                json.dumps(error_payload, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
 
@@ -836,30 +1000,37 @@ def main():
     )
 
     parser.add_argument(
+        "--segment-seconds",
+        type=int,
+        default=300,
+        help="Split audio into N-second chunks. Default: 300 seconds.",
+    )
+
+    parser.add_argument(
         "--realtime",
         action="store_true",
-        help="Send chunks in real-time pacing. Recommended for long audio.",
+        help="Send chunks in real-time pacing. Recommended for complete long audio transcription.",
     )
 
     parser.add_argument(
         "--receive-timeout",
         type=float,
-        default=600.0,
-        help="Seconds to wait for done after EOF. Default: 600",
+        default=1200.0,
+        help="Minimum seconds to wait for done after EOF. Default: 1200.",
     )
 
     parser.add_argument(
         "--fast-sleep",
         type=float,
         default=0.005,
-        help="Sleep between chunks in non-realtime mode. Default: 0.005 sec",
+        help="Sleep between chunks in non-realtime mode. Default: 0.005 sec.",
     )
 
     parser.add_argument(
         "--download",
         action="store_true",
         default=True,
-        help="Download audios/references from GCS. Default: true",
+        help="Download audios/references from GCS. Default: true.",
     )
 
     parser.add_argument(
@@ -873,7 +1044,7 @@ def main():
         "--upload",
         action="store_true",
         default=True,
-        help="Upload all result files to GCS at the end. Default: true",
+        help="Upload all result files to GCS at the end. Default: true.",
     )
 
     parser.add_argument(
@@ -887,7 +1058,7 @@ def main():
         "--upload-each",
         action="store_true",
         default=True,
-        help="Upload each audio result immediately after benchmarking. Default: true",
+        help="Upload each audio result immediately after benchmarking. Default: true.",
     )
 
     parser.add_argument(
@@ -901,6 +1072,12 @@ def main():
         "--force",
         action="store_true",
         help="Re-run even if output files already exist.",
+    )
+
+    parser.add_argument(
+        "--force-split",
+        action="store_true",
+        help="Recreate WAV segments even if segment files already exist.",
     )
 
     args = parser.parse_args()
