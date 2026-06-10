@@ -6,7 +6,7 @@ Benchmarks Nemotron 3.5 ASR WebSocket server on maria*.mp3 files from GCS.
 
 Input:
   gs://cx-asr-test-data/audios/maria*.mp3
-  gs://cx-asr-test-data/references/maria*_reference.text
+  gs://cx-asr-test-data/references/maria*_reference.txt
 
 Output per audio:
   maria*_latencies.json
@@ -141,8 +141,8 @@ def download_inputs():
     print("\nDownloading maria*.mp3 audios...")
     gcs_cp_many(f"{AUDIO_GCS}/maria*.mp3", AUDIO_DIR)
 
-    print("\nDownloading maria*_reference.text references...")
-    gcs_cp_many(f"{REFERENCE_GCS}/maria*_reference.text", REF_DIR)
+    print("\nDownloading maria*_reference.txt references...")
+    gcs_cp_many(f"{REFERENCE_GCS}/maria*_reference.txt", REF_DIR)
 
 
 def convert_mp3_to_wav_16k_mono(mp3_path: Path) -> Path:
@@ -620,10 +620,10 @@ async def benchmark_one_audio(
 # ---------------------------------------------------------------------
 def find_reference_for_audio(audio_path: Path) -> Optional[Path]:
     """
-    maria1.mp3 -> maria1_reference.text
+    maria1.mp3 -> maria1_reference.txt
     """
 
-    ref_name = f"{audio_path.stem}_reference.text"
+    ref_name = f"{audio_path.stem}_reference.txt"
     ref_path = REF_DIR / ref_name
 
     if ref_path.exists():
