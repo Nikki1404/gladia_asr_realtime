@@ -784,3 +784,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+(nemo_env) root@cx-asr-test:/home/nikita_verma2/nemotron_asr# tail nemotron_benchmark.log 
+  File "/home/nikita_verma2/nemotron_asr/benchmark_maria_nemotron.py", line 495, in benchmark_one_audio
+    await ws.send(chunk)
+  File "/home/nikita_verma2/nemotron_asr/nemo_env/lib/python3.11/site-packages/websockets/asyncio/connection.py", line 485, in send
+    async with self.send_context():
+  File "/usr/lib/python3.11/contextlib.py", line 204, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nikita_verma2/nemotron_asr/nemo_env/lib/python3.11/site-packages/websockets/asyncio/connection.py", line 965, in send_context
+    raise self.protocol.close_exc from original_exc
+websockets.exceptions.ConnectionClosedError: sent 1011 (internal error) keepalive ping timeout; no close frame received
