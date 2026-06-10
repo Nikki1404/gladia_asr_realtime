@@ -18,14 +18,11 @@ If one audio fails:
 Upload output to:
   gs://cx-asr-test-data/results/nemotron_3.5/
 
-Usage:
-  python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600
+Recommended run:
+  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600 > nemotron_benchmark.log 2>&1 &
 
 Resume without re-downloading:
-  python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600 --no-download
-
-Run with nohup:
-  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600 > nemotron_benchmark.log 2>&1 &
+  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600 --no-download > nemotron_benchmark_resume.log 2>&1 &
 """
 
 import argparse
@@ -70,11 +67,12 @@ _LANG_TAG_RE = re.compile(r"<[a-z]{2}-[A-Z]{2}>\s*")
 
 
 # ---------------------------------------------------------------------
-# Helpers
+# Basic helpers
 # ---------------------------------------------------------------------
 def clean_text(text: str) -> str:
     if not text:
         return ""
+
     return _LANG_TAG_RE.sub("", text).strip()
 
 
@@ -96,8 +94,10 @@ def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
     if check and result.returncode != 0:
         if result.stdout:
             print(result.stdout, flush=True)
+
         if result.stderr:
             print(result.stderr, file=sys.stderr, flush=True)
+
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
 
     return result
@@ -209,7 +209,7 @@ def read_wav_pcm16(wav_path: Path) -> Tuple[bytes, float]:
 
 def natural_key(path: Path):
     """
-    Makes maria1, maria2, maria10 sort naturally instead of maria1, maria10, maria2.
+    Makes maria1, maria2, maria10 sort naturally.
     """
 
     return [
@@ -285,16 +285,16 @@ def calculate_wer_cer_ser(reference_text: str, hypothesis_text: str) -> Dict:
     char_edits = levenshtein_distance(ref_chars, hyp_chars)
     cer = char_edits / max(1, len(ref_chars))
 
-    # SER:
-    # If reference has multiple lines, compare line-by-line.
-    # If reference has one long line, SER is 1.0 if any word error exists.
     ref_lines = [x.strip() for x in reference_text.splitlines() if x.strip()]
     hyp_lines = [x.strip() for x in hypothesis_text.splitlines() if x.strip()]
 
+    # IMPORTANT:
+    # If reference is one continuous paragraph, SER is not meaningful.
+    # So we return null instead of misleading 100%.
     if len(ref_lines) <= 1:
-        sentence_errors = 1 if word_edits > 0 else 0
-        sentence_count = 1
-        ser = 1.0 if word_edits > 0 else 0.0
+        sentence_errors = None
+        sentence_count = len(ref_lines)
+        ser = None
     else:
         sentence_count = len(ref_lines)
         sentence_errors = 0
@@ -316,7 +316,7 @@ def calculate_wer_cer_ser(reference_text: str, hypothesis_text: str) -> Dict:
         "cer": cer,
         "cer_percent": cer * 100,
         "ser": ser,
-        "ser_percent": ser * 100,
+        "ser_percent": ser * 100 if ser is not None else None,
         "word_edits": word_edits,
         "reference_words": len(ref_words),
         "hypothesis_words": len(hyp_words),
@@ -356,9 +356,8 @@ async def benchmark_one_audio(
 
     connection_start = time.time()
 
-    # Important:
-    # ping_interval=None and ping_timeout=None prevent client-side keepalive timeout
-    # during long/heavy ASR processing.
+    # Disable client-side ping timeout to avoid:
+    # keepalive ping timeout; no close frame received
     async with websockets.connect(
         url,
         ping_interval=None,
@@ -426,12 +425,10 @@ async def benchmark_one_audio(
                                 "server_timestamp_utc": server_timestamp_utc,
                                 "latency_from_start_ms": (
                                     now - connection_start
-                                )
-                                * 1000,
+                                ) * 1000,
                                 "latency_from_send_start_ms": (
                                     now - send_start
-                                )
-                                * 1000,
+                                ) * 1000,
                                 "latency_from_first_chunk_ms": (
                                     (now - first_chunk_sent_at) * 1000
                                     if first_chunk_sent_at
@@ -470,12 +467,10 @@ async def benchmark_one_audio(
                             "type": ev_type,
                             "latency_from_start_ms": (
                                 now - connection_start
-                            )
-                            * 1000,
+                            ) * 1000,
                             "latency_from_send_start_ms": (
                                 now - send_start
-                            )
-                            * 1000,
+                            ) * 1000,
                             "latency_from_first_chunk_ms": (
                                 (now - first_chunk_sent_at) * 1000
                                 if first_chunk_sent_at
@@ -555,9 +550,10 @@ async def benchmark_one_audio(
 
     total_processing_time_sec = time.time() - connection_start
 
-    # Transcript is line-by-line:
-    # one final ASR segment per line.
-    transcript = "\n".join(t.strip() for t in final_texts if t.strip())
+    # IMPORTANT:
+    # Transcript is one continuous paragraph to match your reference format.
+    transcript = " ".join(t.strip() for t in final_texts if t.strip())
+    transcript = re.sub(r"\s+", " ", transcript).strip()
 
     first_response = response_events[0] if response_events else None
     first_final = next((x for x in response_events if x.get("is_final")), None)
@@ -624,9 +620,7 @@ async def benchmark_one_audio(
             "partial_count": partial_count,
             "final_count": final_count,
             "total_response_count": len(response_events),
-            "transcript_lines": len(
-                [x for x in transcript.splitlines() if x.strip()]
-            ),
+            "transcript_lines": 1 if transcript else 0,
             "transcript_words": len(transcript.split()),
             "transcript_chars": len(transcript),
         },
@@ -702,11 +696,7 @@ async def run_benchmark(args):
         transcript_out = OUT_DIR / f"{output_prefix}_transcript.txt"
         error_out = OUT_DIR / f"{output_prefix}_error.json"
 
-        if (
-            latency_out.exists()
-            and transcript_out.exists()
-            and not args.force
-        ):
+        if latency_out.exists() and transcript_out.exists() and not args.force:
             print(f"[skip] Existing output found for {output_prefix}, skipping.", flush=True)
             skipped += 1
 
@@ -752,10 +742,16 @@ async def run_benchmark(args):
             acc = benchmark["result"].get("accuracy_metrics")
 
             if acc:
+                ser_str = (
+                    f"{acc['ser_percent']:.2f}%"
+                    if acc.get("ser_percent") is not None
+                    else "N/A"
+                )
+
                 print(
                     f"WER={acc['wer_percent']:.2f}% "
                     f"CER={acc['cer_percent']:.2f}% "
-                    f"SER={acc['ser_percent']:.2f}%",
+                    f"SER={ser_str}",
                     flush=True,
                 )
 
