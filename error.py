@@ -12,20 +12,20 @@ Output per audio:
   maria*_latencies.json
   maria*_transcript.txt
 
+If one audio fails:
+  maria*_error.json
+
 Upload output to:
   gs://cx-asr-test-data/results/nemotron_3.5/
 
 Usage:
-  python benchmark_maria_nemotron.py
+  python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600
 
-Optional:
-  python benchmark_maria_nemotron.py --limit 15
-  python benchmark_maria_nemotron.py --language auto
-  python benchmark_maria_nemotron.py --language es-US
-  python benchmark_maria_nemotron.py --language en-US
-  python benchmark_maria_nemotron.py --realtime
-  python benchmark_maria_nemotron.py --no-download
-  python benchmark_maria_nemotron.py --no-upload
+Resume without re-downloading:
+  python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600 --no-download
+
+Run with nohup:
+  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --receive-timeout 600 > nemotron_benchmark.log 2>&1 &
 """
 
 import argparse
@@ -84,7 +84,7 @@ def ensure_dirs():
 
 
 def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
-    print("[cmd]", " ".join(cmd))
+    print("[cmd]", " ".join(cmd), flush=True)
 
     result = subprocess.run(
         cmd,
@@ -94,8 +94,10 @@ def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
     )
 
     if check and result.returncode != 0:
-        print(result.stdout)
-        print(result.stderr, file=sys.stderr)
+        if result.stdout:
+            print(result.stdout, flush=True)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, flush=True)
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
 
     return result
@@ -135,13 +137,27 @@ def gcs_upload_dir(src_dir: Path, dst_gcs: str):
         run_cmd(["gsutil", "-m", "cp", f"{src_dir}/*", f"{dst_gcs}/"])
 
 
+def gcs_upload_files(files: List[Path], dst_gcs: str):
+    cli = find_storage_cli()
+
+    for file_path in files:
+        if not file_path.exists():
+            print(f"[warn] File not found, skipping upload: {file_path}", flush=True)
+            continue
+
+        if cli == "gcloud":
+            run_cmd(["gcloud", "storage", "cp", str(file_path), f"{dst_gcs}/"])
+        else:
+            run_cmd(["gsutil", "cp", str(file_path), f"{dst_gcs}/"])
+
+
 def download_inputs():
     ensure_dirs()
 
-    print("\nDownloading maria*.mp3 audios...")
+    print("\nDownloading maria*.mp3 audios...", flush=True)
     gcs_cp_many(f"{AUDIO_GCS}/maria*.mp3", AUDIO_DIR)
 
-    print("\nDownloading maria*_reference.txt references...")
+    print("\nDownloading maria*_reference.txt references...", flush=True)
     gcs_cp_many(f"{REFERENCE_GCS}/maria*_reference.txt", REF_DIR)
 
 
@@ -191,6 +207,17 @@ def read_wav_pcm16(wav_path: Path) -> Tuple[bytes, float]:
     return audio_i16.tobytes(), audio_duration_sec
 
 
+def natural_key(path: Path):
+    """
+    Makes maria1, maria2, maria10 sort naturally instead of maria1, maria10, maria2.
+    """
+
+    return [
+        int(x) if x.isdigit() else x.lower()
+        for x in re.split(r"(\d+)", path.name)
+    ]
+
+
 # ---------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------
@@ -235,13 +262,7 @@ def levenshtein_distance(a: List[str], b: List[str]) -> int:
             delete_cost = previous[j] + 1
             replace_cost = previous[j - 1] + (ca != cb)
 
-            current.append(
-                min(
-                    insert_cost,
-                    delete_cost,
-                    replace_cost,
-                )
-            )
+            current.append(min(insert_cost, delete_cost, replace_cost))
 
         previous = current
 
@@ -318,6 +339,7 @@ async def benchmark_one_audio(
     url: str,
     realtime: bool,
     receive_timeout_sec: float,
+    fast_sleep_sec: float,
 ) -> Dict:
     raw_bytes, audio_duration_sec = read_wav_pcm16(wav_path)
 
@@ -334,11 +356,15 @@ async def benchmark_one_audio(
 
     connection_start = time.time()
 
+    # Important:
+    # ping_interval=None and ping_timeout=None prevent client-side keepalive timeout
+    # during long/heavy ASR processing.
     async with websockets.connect(
         url,
-        ping_interval=20,
-        ping_timeout=120,
+        ping_interval=None,
+        ping_timeout=None,
         max_size=None,
+        close_timeout=30,
     ) as ws:
         connected_at = time.time()
         connection_time_sec = connected_at - connection_start
@@ -502,7 +528,7 @@ async def benchmark_one_audio(
                 if sleep_for > 0:
                     await asyncio.sleep(sleep_for)
             else:
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(fast_sleep_sec)
 
         send_end = time.time()
         send_duration_sec = send_end - send_start
@@ -516,7 +542,8 @@ async def benchmark_one_audio(
             )
         except asyncio.TimeoutError:
             print(
-                f"[warn] Timeout waiting for done event after EOF: {wav_path.name}"
+                f"[warn] Timeout waiting for done event after EOF: {wav_path.name}",
+                flush=True,
             )
 
         recv_task.cancel()
@@ -528,9 +555,8 @@ async def benchmark_one_audio(
 
     total_processing_time_sec = time.time() - connection_start
 
-    # Important:
-    # transcript.txt is generated line-by-line.
-    # Each final ASR segment becomes one line.
+    # Transcript is line-by-line:
+    # one final ASR segment per line.
     transcript = "\n".join(t.strip() for t in final_texts if t.strip())
 
     first_response = response_events[0] if response_events else None
@@ -623,11 +649,14 @@ def find_reference_for_audio(audio_path: Path) -> Optional[Path]:
     maria1.mp3 -> maria1_reference.txt
     """
 
-    ref_name = f"{audio_path.stem}_reference.txt"
-    ref_path = REF_DIR / ref_name
+    candidates = [
+        REF_DIR / f"{audio_path.stem}_reference.txt",
+        REF_DIR / f"{audio_path.stem}_reference.text",
+    ]
 
-    if ref_path.exists():
-        return ref_path
+    for ref_path in candidates:
+        if ref_path.exists():
+            return ref_path
 
     return None
 
@@ -641,7 +670,7 @@ async def run_benchmark(args):
     if args.download:
         download_inputs()
 
-    audio_files = sorted(AUDIO_DIR.glob("maria*.mp3"))
+    audio_files = sorted(AUDIO_DIR.glob("maria*.mp3"), key=natural_key)
 
     if args.limit:
         audio_files = audio_files[: args.limit]
@@ -649,67 +678,141 @@ async def run_benchmark(args):
     if not audio_files:
         raise RuntimeError(f"No maria*.mp3 files found in {AUDIO_DIR}")
 
-    print(f"\nFound {len(audio_files)} maria audio files.")
+    print(f"\nFound {len(audio_files)} maria audio files.", flush=True)
+
+    completed = 0
+    failed = 0
+    skipped = 0
 
     for idx, audio_path in enumerate(audio_files, start=1):
-        print("\n" + "=" * 80)
-        print(f"[{idx}/{len(audio_files)}] Benchmarking: {audio_path.name}")
-        print("=" * 80)
+        print("\n" + "=" * 80, flush=True)
+        print(f"[{idx}/{len(audio_files)}] Benchmarking: {audio_path.name}", flush=True)
+        print("=" * 80, flush=True)
 
         reference_path = find_reference_for_audio(audio_path)
 
         if reference_path:
-            print(f"Reference: {reference_path.name}")
+            print(f"Reference: {reference_path.name}", flush=True)
         else:
-            print(f"[warn] No reference found for {audio_path.name}")
-
-        wav_path = convert_mp3_to_wav_16k_mono(audio_path)
+            print(f"[warn] No reference found for {audio_path.name}", flush=True)
 
         output_prefix = audio_path.stem
 
         latency_out = OUT_DIR / f"{output_prefix}_latencies.json"
         transcript_out = OUT_DIR / f"{output_prefix}_transcript.txt"
+        error_out = OUT_DIR / f"{output_prefix}_error.json"
 
-        benchmark = await benchmark_one_audio(
-            wav_path=wav_path,
-            original_audio_path=audio_path,
-            reference_path=reference_path,
-            language=args.language,
-            url=args.url,
-            realtime=args.realtime,
-            receive_timeout_sec=args.receive_timeout,
-        )
+        if (
+            latency_out.exists()
+            and transcript_out.exists()
+            and not args.force
+        ):
+            print(f"[skip] Existing output found for {output_prefix}, skipping.", flush=True)
+            skipped += 1
 
-        latency_out.write_text(
-            json.dumps(
-                benchmark["result"],
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+            if args.upload_each:
+                try:
+                    gcs_upload_files([latency_out, transcript_out], RESULT_GCS)
+                except Exception as upload_error:
+                    print(
+                        f"[warn] Could not upload skipped existing files: {upload_error}",
+                        flush=True,
+                    )
 
-        transcript_out.write_text(
-            benchmark["transcript"],
-            encoding="utf-8",
-        )
+            continue
 
-        acc = benchmark["result"].get("accuracy_metrics")
+        try:
+            wav_path = convert_mp3_to_wav_16k_mono(audio_path)
 
-        if acc:
-            print(
-                f"WER={acc['wer_percent']:.2f}% "
-                f"CER={acc['cer_percent']:.2f}% "
-                f"SER={acc['ser_percent']:.2f}%"
+            benchmark = await benchmark_one_audio(
+                wav_path=wav_path,
+                original_audio_path=audio_path,
+                reference_path=reference_path,
+                language=args.language,
+                url=args.url,
+                realtime=args.realtime,
+                receive_timeout_sec=args.receive_timeout,
+                fast_sleep_sec=args.fast_sleep,
             )
 
-        print(f"Saved: {latency_out}")
-        print(f"Saved: {transcript_out}")
+            latency_out.write_text(
+                json.dumps(
+                    benchmark["result"],
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            transcript_out.write_text(
+                benchmark["transcript"],
+                encoding="utf-8",
+            )
+
+            acc = benchmark["result"].get("accuracy_metrics")
+
+            if acc:
+                print(
+                    f"WER={acc['wer_percent']:.2f}% "
+                    f"CER={acc['cer_percent']:.2f}% "
+                    f"SER={acc['ser_percent']:.2f}%",
+                    flush=True,
+                )
+
+            print(f"Saved: {latency_out}", flush=True)
+            print(f"Saved: {transcript_out}", flush=True)
+
+            completed += 1
+
+            if args.upload_each:
+                print(f"Uploading result files for {output_prefix} to GCS...", flush=True)
+                gcs_upload_files([latency_out, transcript_out], RESULT_GCS)
+
+        except Exception as e:
+            failed += 1
+            print(f"[error] Failed benchmarking {audio_path.name}: {e}", flush=True)
+
+            error_payload = {
+                "audio_file": str(audio_path),
+                "reference_file": str(reference_path) if reference_path else None,
+                "timestamp": datetime.now().isoformat(),
+                "model": MODEL_NAME,
+                "language": args.language,
+                "server_url": args.url,
+                "error": repr(e),
+                "status": "failed",
+            }
+
+            error_out.write_text(
+                json.dumps(
+                    error_payload,
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            print(f"Saved error file: {error_out}", flush=True)
+
+            if args.upload_each:
+                try:
+                    gcs_upload_files([error_out], RESULT_GCS)
+                except Exception as upload_error:
+                    print(f"[warn] Could not upload error file: {upload_error}", flush=True)
+
+            continue
 
     if args.upload:
-        print("\nUploading result files to GCS...")
+        print("\nUploading all result files to GCS...", flush=True)
         gcs_upload_dir(OUT_DIR, RESULT_GCS)
-        print(f"Uploaded to: {RESULT_GCS}/")
+        print(f"Uploaded to: {RESULT_GCS}/", flush=True)
+
+    print("\nBenchmark complete.", flush=True)
+    print(f"Completed: {completed}", flush=True)
+    print(f"Skipped:   {skipped}", flush=True)
+    print(f"Failed:    {failed}", flush=True)
+    print(f"Results:   {OUT_DIR}", flush=True)
+    print(f"GCS:       {RESULT_GCS}/", flush=True)
 
 
 def main():
@@ -739,14 +842,21 @@ def main():
     parser.add_argument(
         "--realtime",
         action="store_true",
-        help="Send chunks in real-time pacing. Default is fast mode.",
+        help="Send chunks in real-time pacing. Recommended for long audio.",
     )
 
     parser.add_argument(
         "--receive-timeout",
         type=float,
-        default=120.0,
-        help="Seconds to wait for done after EOF. Default: 120",
+        default=600.0,
+        help="Seconds to wait for done after EOF. Default: 600",
+    )
+
+    parser.add_argument(
+        "--fast-sleep",
+        type=float,
+        default=0.005,
+        help="Sleep between chunks in non-realtime mode. Default: 0.005 sec",
     )
 
     parser.add_argument(
@@ -767,14 +877,34 @@ def main():
         "--upload",
         action="store_true",
         default=True,
-        help="Upload result files to GCS. Default: true",
+        help="Upload all result files to GCS at the end. Default: true",
     )
 
     parser.add_argument(
         "--no-upload",
         dest="upload",
         action="store_false",
-        help="Skip GCS upload.",
+        help="Skip final bulk GCS upload.",
+    )
+
+    parser.add_argument(
+        "--upload-each",
+        action="store_true",
+        default=True,
+        help="Upload each audio result immediately after benchmarking. Default: true",
+    )
+
+    parser.add_argument(
+        "--no-upload-each",
+        dest="upload_each",
+        action="store_false",
+        help="Do not upload each result immediately.",
+    )
+
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run even if output files already exist.",
     )
 
     args = parser.parse_args()
@@ -784,69 +914,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-(nemo_env) root@cx-asr-test:/home/nikita_verma2/nemotron_asr# tail --200 nemotron_benchmark.log 
-tail: unrecognized option '--200'
-Try 'tail --help' for more information.
-(nemo_env) root@cx-asr-test:/home/nikita_verma2/nemotron_asr# tail -200 nemotron_benchmark.log 
-nohup: ignoring input
-
-Downloading maria*.mp3 audios...
-[cmd] gcloud storage cp gs://cx-asr-test-data/audios/maria*.mp3 benchmark_workspace/audios
-
-Downloading maria*_reference.txt references...
-[cmd] gcloud storage cp gs://cx-asr-test-data/references/maria*_reference.txt benchmark_workspace/references
-
-Found 15 maria audio files.
-
-================================================================================
-[1/15] Benchmarking: maria1.mp3
-================================================================================
-Reference: maria1_reference.txt
-[cmd] ffmpeg -y -i benchmark_workspace/audios/maria1.mp3 -ac 1 -ar 16000 -sample_fmt s16 benchmark_workspace/wav_16k/maria1.wav
-WER=33.58% CER=24.96% SER=100.00%
-Saved: benchmark_workspace/results/nemotron_3.5/maria1_latencies.json
-Saved: benchmark_workspace/results/nemotron_3.5/maria1_transcript.txt
-
-================================================================================
-[2/15] Benchmarking: maria10.mp3
-================================================================================
-Reference: maria10_reference.txt
-[cmd] ffmpeg -y -i benchmark_workspace/audios/maria10.mp3 -ac 1 -ar 16000 -sample_fmt s16 benchmark_workspace/wav_16k/maria10.wav
-WER=78.83% CER=74.48% SER=100.00%
-Saved: benchmark_workspace/results/nemotron_3.5/maria10_latencies.json
-Saved: benchmark_workspace/results/nemotron_3.5/maria10_transcript.txt
-
-================================================================================
-[3/15] Benchmarking: maria16.mp3
-================================================================================
-Reference: maria16_reference.txt
-[cmd] ffmpeg -y -i benchmark_workspace/audios/maria16.mp3 -ac 1 -ar 16000 -sample_fmt s16 benchmark_workspace/wav_16k/maria16.wav
-Traceback (most recent call last):
-  File "/home/nikita_verma2/nemotron_asr/benchmark_maria_nemotron.py", line 786, in <module>
-    main()
-  File "/home/nikita_verma2/nemotron_asr/benchmark_maria_nemotron.py", line 782, in main
-    asyncio.run(run_benchmark(args))
-  File "/usr/lib/python3.11/asyncio/runners.py", line 190, in run
-    return runner.run(main)
-           ^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.11/asyncio/runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.11/asyncio/base_events.py", line 653, in run_until_complete
-    return future.result()
-           ^^^^^^^^^^^^^^^
-  File "/home/nikita_verma2/nemotron_asr/benchmark_maria_nemotron.py", line 673, in run_benchmark
-    benchmark = await benchmark_one_audio(
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nikita_verma2/nemotron_asr/benchmark_maria_nemotron.py", line 495, in benchmark_one_audio
-    await ws.send(chunk)
-  File "/home/nikita_verma2/nemotron_asr/nemo_env/lib/python3.11/site-packages/websockets/asyncio/connection.py", line 485, in send
-    async with self.send_context():
-  File "/usr/lib/python3.11/contextlib.py", line 204, in __aenter__
-    return await anext(self.gen)
-           ^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nikita_verma2/nemotron_asr/nemo_env/lib/python3.11/site-packages/websockets/asyncio/connection.py", line 965, in send_context
-    raise self.protocol.close_exc from original_exc
-websockets.exceptions.ConnectionClosedError: sent 1011 (internal error) keepalive ping timeout; no close frame received
