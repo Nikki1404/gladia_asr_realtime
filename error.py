@@ -1,936 +1,786 @@
+#!/usr/bin/env python3
+"""
+benchmark_maria_nemotron.py
+
+Benchmarks Nemotron 3.5 ASR WebSocket server on maria*.mp3 files from GCS.
+
+Input:
+  gs://cx-asr-test-data/audios/maria*.mp3
+  gs://cx-asr-test-data/references/maria*_reference.text
+
+Output per audio:
+  maria*_latencies.json
+  maria*_transcript.txt
+
+Upload output to:
+  gs://cx-asr-test-data/results/nemotron_3.5/
+
+Usage:
+  python benchmark_maria_nemotron.py
+
+Optional:
+  python benchmark_maria_nemotron.py --limit 15
+  python benchmark_maria_nemotron.py --language auto
+  python benchmark_maria_nemotron.py --language es-US
+  python benchmark_maria_nemotron.py --language en-US
+  python benchmark_maria_nemotron.py --realtime
+  python benchmark_maria_nemotron.py --no-download
+  python benchmark_maria_nemotron.py --no-upload
+"""
+
+import argparse
 import asyncio
 import json
-import logging
-import os
+import re
+import shutil
 import subprocess
 import sys
-import tempfile
+import time
 import wave
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import resampy
-from fastapi import FastAPI, WebSocket, UploadFile, File, Form
-from fastapi.responses import JSONResponse, PlainTextResponse
+import websockets
 
-from app.config import load_config, Config, MODEL_MAP
-from app.factory import build_engine
-from app.streaming_session import StreamingSession
-from app.asr_engines.base import ASREngine
-
-
-cfg = load_config()
-
-logging.basicConfig(
-    level=cfg.log_level,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-
-log = logging.getLogger("asr_server")
-
-app = FastAPI(
-    title="Nemotron 3.5 ASR Server",
-    version="1.0.0",
-)
-
-ENGINE_CACHE: dict[str, ASREngine] = {}
 
 # ---------------------------------------------------------------------
-# Server-side audio/event logging
+# Config
 # ---------------------------------------------------------------------
-AUDIO_LOG_DIR = Path(os.getenv("AUDIO_LOG_DIR", "/srv/audio_logs"))
-AUDIO_LOG_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_WS_URL = "ws://35.254.200.29:8003/asr/realtime-custom-vad"
+
+AUDIO_GCS = "gs://cx-asr-test-data/audios"
+REFERENCE_GCS = "gs://cx-asr-test-data/references"
+RESULT_GCS = "gs://cx-asr-test-data/results/nemotron_3.5"
+
+MODEL_NAME = "nemotron-3.5-asr-streaming-0.6b"
+
+SAMPLE_RATE = 16000
+CHUNK_MS = 100
+CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_MS / 1000) * 2
+
+WORK_DIR = Path("benchmark_workspace")
+AUDIO_DIR = WORK_DIR / "audios"
+REF_DIR = WORK_DIR / "references"
+WAV_DIR = WORK_DIR / "wav_16k"
+OUT_DIR = WORK_DIR / "results" / "nemotron_3.5"
+
+_LANG_TAG_RE = re.compile(r"<[a-z]{2}-[A-Z]{2}>\s*")
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    return _LANG_TAG_RE.sub("", text).strip()
 
 
-def make_session_id(client) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-
-    client_host = "unknown"
-    client_port = "unknown"
-
-    try:
-        client_host = str(client.host)
-        client_port = str(client.port)
-    except Exception:
-        pass
-
-    safe_host = client_host.replace(".", "_").replace(":", "_")
-    return f"{ts}_{safe_host}_{client_port}"
+def ensure_dirs():
+    for d in [AUDIO_DIR, REF_DIR, WAV_DIR, OUT_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
 
 
-def save_pcm_as_wav(
-    pcm_bytes: bytes,
-    wav_path: Path,
-    sample_rate: int,
-):
+def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
+    print("[cmd]", " ".join(cmd))
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if check and result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr, file=sys.stderr)
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+
+    return result
+
+
+def find_storage_cli() -> str:
     """
-    Save raw PCM16 mono bytes as WAV.
+    Prefer gcloud storage. Fallback to gsutil.
     """
 
-    if not pcm_bytes:
-        return
+    if shutil.which("gcloud"):
+        return "gcloud"
 
-    with wave.open(str(wav_path), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_bytes)
+    if shutil.which("gsutil"):
+        return "gsutil"
 
-
-def write_json(path: Path, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    raise RuntimeError(
+        "Neither gcloud nor gsutil found. Install Google Cloud SDK first."
+    )
 
 
-def append_jsonl(path: Path, data: dict):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+def gcs_cp_many(src_pattern: str, dst_dir: Path):
+    cli = find_storage_cli()
+
+    if cli == "gcloud":
+        run_cmd(["gcloud", "storage", "cp", src_pattern, str(dst_dir)])
+    else:
+        run_cmd(["gsutil", "-m", "cp", src_pattern, str(dst_dir)])
 
 
-# ---------------------------------------------------------------------
-# Startup / Engine loading
-# ---------------------------------------------------------------------
-async def preload_engines():
-    log.info("Preloading ASR engines...")
+def gcs_upload_dir(src_dir: Path, dst_gcs: str):
+    cli = find_storage_cli()
 
-    for backend, model_name in MODEL_MAP.items():
-        try:
-            log.info(f"Initializing engine: {backend} ({model_name})")
-
-            tmp_cfg = Config()
-            object.__setattr__(tmp_cfg, "asr_backend", backend)
-            object.__setattr__(tmp_cfg, "model_name", model_name)
-            object.__setattr__(tmp_cfg, "device", cfg.device)
-            object.__setattr__(tmp_cfg, "sample_rate", cfg.sample_rate)
-
-            engine = build_engine(tmp_cfg)
-            load_sec = engine.load()
-
-            ENGINE_CACHE[backend] = engine
-
-            log.info(f"✅ Preloaded '{backend}' in {load_sec:.2f}s")
-
-        except Exception:
-            log.exception(f"Failed to preload '{backend}'")
-
-    log.info(f"All engines preloaded. Available: {list(ENGINE_CACHE.keys())}")
+    if cli == "gcloud":
+        run_cmd(["gcloud", "storage", "cp", f"{src_dir}/*", f"{dst_gcs}/"])
+    else:
+        run_cmd(["gsutil", "-m", "cp", f"{src_dir}/*", f"{dst_gcs}/"])
 
 
-@app.on_event("startup")
-async def startup_event():
-    log.info("Server startup initiated")
-    await preload_engines()
+def download_inputs():
+    ensure_dirs()
+
+    print("\nDownloading maria*.mp3 audios...")
+    gcs_cp_many(f"{AUDIO_GCS}/maria*.mp3", AUDIO_DIR)
+
+    print("\nDownloading maria*_reference.text references...")
+    gcs_cp_many(f"{REFERENCE_GCS}/maria*_reference.text", REF_DIR)
 
 
-def get_engine(backend: str) -> ASREngine:
-    if backend not in ENGINE_CACHE:
+def convert_mp3_to_wav_16k_mono(mp3_path: Path) -> Path:
+    wav_path = WAV_DIR / f"{mp3_path.stem}.wav"
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(mp3_path),
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-sample_fmt",
+        "s16",
+        str(wav_path),
+    ]
+
+    run_cmd(cmd)
+    return wav_path
+
+
+def read_wav_pcm16(wav_path: Path) -> Tuple[bytes, float]:
+    with wave.open(str(wav_path), "rb") as wf:
+        n_channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        file_sr = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw_audio = wf.readframes(n_frames)
+
+    if sample_width != 2:
+        raise ValueError(f"{wav_path} is not 16-bit PCM WAV")
+
+    audio_i16 = np.frombuffer(raw_audio, dtype=np.int16)
+
+    if n_channels == 2:
+        audio_i16 = audio_i16.reshape(-1, 2).mean(axis=1).astype(np.int16)
+
+    if file_sr != SAMPLE_RATE:
         raise ValueError(
-            f"Engine '{backend}' not loaded. Available: {list(ENGINE_CACHE.keys())}"
-        )
-    return ENGINE_CACHE[backend]
-
-
-# ---------------------------------------------------------------------
-# Health
-# ---------------------------------------------------------------------
-@app.get("/")
-async def root():
-    return {
-        "status": "ok",
-        "service": "Nemotron 3.5 ASR Server",
-        "websocket_endpoint": "/asr/realtime-custom-vad",
-        "openai_transcription_endpoint": "/v1/audio/transcriptions",
-        "audio_log_dir": str(AUDIO_LOG_DIR),
-    }
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "engines": list(ENGINE_CACHE.keys()),
-        "device": cfg.device,
-        "sample_rate": cfg.sample_rate,
-        "audio_log_dir": str(AUDIO_LOG_DIR),
-    }
-
-
-# ---------------------------------------------------------------------
-# OpenAI-compatible helpers
-# ---------------------------------------------------------------------
-def convert_upload_to_pcm16_16k_mono(
-    input_bytes: bytes,
-    suffix: str = ".wav",
-) -> bytes:
-    """
-    Convert uploaded audio into raw PCM16 mono audio at cfg.sample_rate.
-
-    This supports WAV, MP3, M4A, FLAC, OGG, WEBM, etc., as long as ffmpeg
-    can decode it.
-
-    Output:
-        raw PCM bytes, not WAV container.
-    """
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as in_file:
-        in_file.write(input_bytes)
-        input_path = in_file.name
-
-    output_path = input_path + ".pcm"
-
-    try:
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            input_path,
-            "-ac",
-            "1",
-            "-ar",
-            str(cfg.sample_rate),
-            "-f",
-            "s16le",
-            "-acodec",
-            "pcm_s16le",
-            output_path,
-        ]
-
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            f"{wav_path} sample rate is {file_sr}, expected {SAMPLE_RATE}"
         )
 
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {result.stderr}")
-
-        with open(output_path, "rb") as f:
-            return f.read()
-
-    finally:
-        try:
-            os.remove(input_path)
-        except FileNotFoundError:
-            pass
-
-        try:
-            os.remove(output_path)
-        except FileNotFoundError:
-            pass
+    audio_duration_sec = len(audio_i16) / SAMPLE_RATE
+    return audio_i16.tobytes(), audio_duration_sec
 
 
-def normalize_language(language: Optional[str]) -> str:
+# ---------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------
+def normalize_for_metrics(text: str) -> str:
     """
-    Keep your server's language style.
+    Normalize multilingual transcript text for WER/CER/SER.
 
-    Examples:
-        None   -> auto
-        ""     -> auto
-        auto   -> auto
-        en     -> en-US
-        es     -> es-US
-        en-US  -> en-US
-        es-US  -> es-US
-    """
-
-    if not language:
-        return "auto"
-
-    lang = language.strip()
-
-    if not lang:
-        return "auto"
-
-    low = lang.lower()
-
-    if low == "auto":
-        return "auto"
-
-    if low == "en":
-        return "en-US"
-
-    if low == "es":
-        return "es-US"
-
-    return lang
-
-
-def clean_model_leaked_tags(text: str) -> str:
-    """
-    Removes leaked prompt language tags like:
-        <en-US>
-        <es-US>
+    - lowercases
+    - converts underscores to spaces
+    - removes punctuation
+    - keeps accented characters
     """
 
     if not text:
         return ""
 
-    import re
+    text = text.lower()
+    text = text.replace("_", " ")
+    text = re.sub(r"<[a-z]{2}-[a-z]{2}>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[^\w\sáéíóúüñàèìòùç]", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
 
-    return re.sub(r"<[a-z]{2}-[A-Z]{2}>\s*", "", text).strip()
+    return text
 
 
-async def run_pcm_through_session(
-    pcm_bytes: bytes,
-    engine: ASREngine,
-    language: str,
-    source: str = "openai-http",
-    log_audio: bool = True,
-) -> str:
+def levenshtein_distance(a: List[str], b: List[str]) -> int:
     """
-    Runs raw PCM16 audio through the same StreamingSession used by WS mode.
-    Returns combined final transcript.
-
-    Used by:
-        POST /v1/audio/transcriptions
+    Memory-efficient Levenshtein distance.
+    Works for words or characters.
     """
 
-    session_id = f"openai_http_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
-    session_dir = AUDIO_LOG_DIR / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
+    if len(a) < len(b):
+        a, b = b, a
 
-    raw_pcm_path = session_dir / "audio.raw.pcm"
-    wav_path = session_dir / "audio.wav"
-    metadata_path = session_dir / "metadata.json"
-    events_path = session_dir / "events.jsonl"
+    previous = list(range(len(b) + 1))
 
-    started_at = utc_now_iso()
-    start_perf = asyncio.get_running_loop().time()
+    for i, ca in enumerate(a, start=1):
+        current = [i]
 
-    session = StreamingSession(engine, cfg)
+        for j, cb in enumerate(b, start=1):
+            insert_cost = current[j - 1] + 1
+            delete_cost = previous[j] + 1
+            replace_cost = previous[j - 1] + (ca != cb)
 
-    final_texts: list[str] = []
-    transcript_events: list[dict] = []
-
-    chunk_ms = 100
-    chunk_bytes = int(cfg.sample_rate * chunk_ms / 1000) * 2
-
-    if log_audio:
-        with open(raw_pcm_path, "wb") as f:
-            f.write(pcm_bytes)
-
-        try:
-            save_pcm_as_wav(
-                pcm_bytes=pcm_bytes,
-                wav_path=wav_path,
-                sample_rate=cfg.sample_rate,
+            current.append(
+                min(
+                    insert_cost,
+                    delete_cost,
+                    replace_cost,
+                )
             )
-        except Exception:
-            log.exception(f"Failed to save OpenAI HTTP WAV | session_id={session_id}")
 
-    write_json(
-        metadata_path,
-        {
-            "session_id": session_id,
-            "source": source,
-            "started_at_utc": started_at,
-            "language": language,
-            "server_sample_rate": cfg.sample_rate,
-            "raw_pcm_bytes": len(pcm_bytes),
-            "audio_duration_sec": round(len(pcm_bytes) / 2 / cfg.sample_rate, 3)
-            if pcm_bytes
-            else 0.0,
-            "audio_raw_pcm_path": str(raw_pcm_path),
-            "audio_wav_path": str(wav_path),
-            "events_path": str(events_path),
-            "status": "started",
-        },
-    )
+        previous = current
 
-    loop = asyncio.get_running_loop()
-
-    for i in range(0, len(pcm_bytes), chunk_bytes):
-        chunk = pcm_bytes[i : i + chunk_bytes]
-
-        if not chunk:
-            continue
-
-        events = await loop.run_in_executor(
-            None,
-            session.process_chunk,
-            chunk,
-        )
-
-        for ev_type, text, ttfb in events:
-            text = clean_model_leaked_tags(text)
-            _log_transcript(ev_type, text, ttfb, language, source)
-
-            event_payload = {
-                "timestamp_utc": utc_now_iso(),
-                "session_id": session_id,
-                "source": source,
-                "type": ev_type,
-                "text": text,
-                "language": language,
-                "ttfb_ms": ttfb,
-            }
-
-            transcript_events.append(event_payload)
-            append_jsonl(events_path, event_payload)
-
-            if ev_type == "final" and text:
-                final_texts.append(text.strip())
-
-    # Flush final pending utterance
-    flush_events = await loop.run_in_executor(
-        None,
-        session.flush,
-    )
-
-    for ev_type, text, ttfb in flush_events:
-        text = clean_model_leaked_tags(text)
-        _log_transcript(ev_type, text, ttfb, language, source)
-
-        event_payload = {
-            "timestamp_utc": utc_now_iso(),
-            "session_id": session_id,
-            "source": source,
-            "type": ev_type,
-            "text": text,
-            "language": language,
-            "ttfb_ms": ttfb,
-        }
-
-        transcript_events.append(event_payload)
-        append_jsonl(events_path, event_payload)
-
-        if ev_type == "final" and text:
-            final_texts.append(text.strip())
-
-    transcript = " ".join(final_texts).strip()
-
-    ended_at = utc_now_iso()
-    end_perf = asyncio.get_running_loop().time()
-    wall_duration_sec = end_perf - start_perf
-
-    write_json(
-        metadata_path,
-        {
-            "session_id": session_id,
-            "source": source,
-            "started_at_utc": started_at,
-            "ended_at_utc": ended_at,
-            "wall_duration_sec": round(wall_duration_sec, 3),
-            "audio_duration_sec": round(len(pcm_bytes) / 2 / cfg.sample_rate, 3)
-            if pcm_bytes
-            else 0.0,
-            "language": language,
-            "server_sample_rate": cfg.sample_rate,
-            "raw_pcm_bytes": len(pcm_bytes),
-            "audio_raw_pcm_path": str(raw_pcm_path),
-            "audio_wav_path": str(wav_path),
-            "events_path": str(events_path),
-            "final_transcript": transcript,
-            "final_transcripts": [
-                ev["text"]
-                for ev in transcript_events
-                if ev.get("type") == "final" and ev.get("text")
-            ],
-            "status": "completed",
-        },
-    )
-
-    log.info(
-        f"OPENAI_HTTP_AUDIO_LOG_END | session_id={session_id} "
-        f"wall_duration_sec={wall_duration_sec:.3f} "
-        f"audio_duration_sec={len(pcm_bytes) / 2 / cfg.sample_rate:.3f} "
-        f"wav={wav_path}"
-    )
-
-    return transcript
+    return previous[-1]
 
 
-# ---------------------------------------------------------------------
-# OpenAI-compatible endpoints for LiveKit
-# ---------------------------------------------------------------------
-@app.get("/v1/models")
-async def list_openai_models():
+def calculate_wer_cer_ser(reference_text: str, hypothesis_text: str) -> Dict:
+    ref_norm = normalize_for_metrics(reference_text)
+    hyp_norm = normalize_for_metrics(hypothesis_text)
+
+    ref_words = ref_norm.split()
+    hyp_words = hyp_norm.split()
+
+    word_edits = levenshtein_distance(ref_words, hyp_words)
+    wer = word_edits / max(1, len(ref_words))
+
+    ref_chars = list(ref_norm.replace(" ", ""))
+    hyp_chars = list(hyp_norm.replace(" ", ""))
+
+    char_edits = levenshtein_distance(ref_chars, hyp_chars)
+    cer = char_edits / max(1, len(ref_chars))
+
+    # SER:
+    # If reference has multiple lines, compare line-by-line.
+    # If reference has one long line, SER is 1.0 if any word error exists.
+    ref_lines = [x.strip() for x in reference_text.splitlines() if x.strip()]
+    hyp_lines = [x.strip() for x in hypothesis_text.splitlines() if x.strip()]
+
+    if len(ref_lines) <= 1:
+        sentence_errors = 1 if word_edits > 0 else 0
+        sentence_count = 1
+        ser = 1.0 if word_edits > 0 else 0.0
+    else:
+        sentence_count = len(ref_lines)
+        sentence_errors = 0
+
+        for i, ref_line in enumerate(ref_lines):
+            hyp_line = hyp_lines[i] if i < len(hyp_lines) else ""
+
+            r = normalize_for_metrics(ref_line).split()
+            h = normalize_for_metrics(hyp_line).split()
+
+            if levenshtein_distance(r, h) > 0:
+                sentence_errors += 1
+
+        ser = sentence_errors / max(1, sentence_count)
+
     return {
-        "object": "list",
-        "data": [
-            {
-                "id": "nemotron-3.5-asr-streaming-0.6b",
-                "object": "model",
-                "owned_by": "local",
-            }
-        ],
+        "wer": wer,
+        "wer_percent": wer * 100,
+        "cer": cer,
+        "cer_percent": cer * 100,
+        "ser": ser,
+        "ser_percent": ser * 100,
+        "word_edits": word_edits,
+        "reference_words": len(ref_words),
+        "hypothesis_words": len(hyp_words),
+        "char_edits": char_edits,
+        "reference_chars": len(ref_chars),
+        "hypothesis_chars": len(hyp_chars),
+        "sentence_errors": sentence_errors,
+        "sentence_count": sentence_count,
     }
 
 
-@app.post("/v1/audio/transcriptions")
-async def openai_audio_transcriptions(
-    file: UploadFile = File(...),
-    model: str = Form("nemotron-3.5-asr-streaming-0.6b"),
-    language: Optional[str] = Form("auto"),
-    response_format: Optional[str] = Form("json"),
-):
-    """
-    OpenAI-compatible transcription endpoint.
-
-    LiveKit openai.STT will call:
-
-        POST /v1/audio/transcriptions
-
-    Therefore LiveKit should use:
-
-        base_url="http://HOST:8003/v1"
-    """
-
-    lang = normalize_language(language)
-
-    log.info(
-        f"OpenAI-compatible STT request | model={model} language={lang} "
-        f"response_format={response_format} filename={file.filename}"
-    )
-
-    if model != "nemotron-3.5-asr-streaming-0.6b":
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": {
-                    "message": f"Unsupported model: {model}",
-                    "type": "invalid_request_error",
-                }
-            },
-        )
-
-    try:
-        engine = get_engine("nemotron")
-    except ValueError as e:
-        log.exception("Nemotron engine not available")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": {
-                    "message": str(e),
-                    "type": "server_error",
-                }
-            },
-        )
-
-    try:
-        engine.set_language(lang)
-
-        audio_bytes = await file.read()
-
-        suffix = ".wav"
-        if file.filename and "." in file.filename:
-            suffix = "." + file.filename.rsplit(".", 1)[-1]
-
-        pcm_bytes = convert_upload_to_pcm16_16k_mono(
-            input_bytes=audio_bytes,
-            suffix=suffix,
-        )
-
-        transcript = await run_pcm_through_session(
-            pcm_bytes=pcm_bytes,
-            engine=engine,
-            language=lang,
-            source="openai-http",
-            log_audio=True,
-        )
-
-        if response_format == "text":
-            return PlainTextResponse(transcript)
-
-        if response_format == "verbose_json":
-            return {
-                "task": "transcribe",
-                "language": lang,
-                "duration": round(len(pcm_bytes) / 2 / cfg.sample_rate, 3)
-                if pcm_bytes
-                else 0.0,
-                "text": transcript,
-                "segments": [],
-            }
-
-        return {
-            "text": transcript,
-        }
-
-    except Exception as e:
-        log.exception("OpenAI-compatible transcription failed")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": {
-                    "message": str(e),
-                    "type": "server_error",
-                }
-            },
-        )
-
-
 # ---------------------------------------------------------------------
-# Existing WebSocket ASR endpoint
+# WebSocket benchmarking
 # ---------------------------------------------------------------------
-@app.websocket("/asr/realtime-custom-vad")
-async def ws_asr(ws: WebSocket):
-    log.info(f"WS connection request from {ws.client}")
-    await ws.accept()
+async def benchmark_one_audio(
+    wav_path: Path,
+    original_audio_path: Path,
+    reference_path: Optional[Path],
+    language: str,
+    url: str,
+    realtime: bool,
+    receive_timeout_sec: float,
+) -> Dict:
+    raw_bytes, audio_duration_sec = read_wav_pcm16(wav_path)
 
-    # Create per-WebSocket session logging folder immediately
-    session_id = make_session_id(ws.client)
-    session_dir = AUDIO_LOG_DIR / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
+    chunks = [
+        raw_bytes[i : i + CHUNK_BYTES]
+        for i in range(0, len(raw_bytes), CHUNK_BYTES)
+    ]
 
-    raw_pcm_path = session_dir / "audio.raw.pcm"
-    wav_path = session_dir / "audio.wav"
-    metadata_path = session_dir / "metadata.json"
-    events_path = session_dir / "events.jsonl"
+    response_events = []
+    final_texts = []
 
-    session_started_at = utc_now_iso()
-    session_start_perf = asyncio.get_running_loop().time()
+    partial_count = 0
+    final_count = 0
 
-    captured_pcm = bytearray()
-    transcript_events: list[dict] = []
+    connection_start = time.time()
 
-    log.info(
-        f"AUDIO_LOG_START | session_id={session_id} client={ws.client} "
-        f"dir={session_dir} started_at={session_started_at}"
-    )
+    async with websockets.connect(
+        url,
+        ping_interval=20,
+        ping_timeout=120,
+        max_size=None,
+    ) as ws:
+        connected_at = time.time()
+        connection_time_sec = connected_at - connection_start
 
-    backend = None
-    client_sample_rate = None
-    language = None
-
-    try:
-        raw_init = await ws.receive_text()
-        init = json.loads(raw_init)
-    except Exception as e:
-        log.warning(f"Bad init message: {e}")
-
-        write_json(
-            metadata_path,
-            {
-                "session_id": session_id,
-                "client": str(ws.client),
-                "started_at_utc": session_started_at,
-                "status": "bad_init_message",
-                "error": str(e),
-            },
-        )
-
-        await ws.close(code=4001)
-        return
-
-    backend = init.get("backend", "nemotron")
-    client_sample_rate = int(init.get("sample_rate", cfg.sample_rate))
-
-    language = init.get("language")
-    if not language:
-        log.warning(
-            f"Client {ws.client} did not send 'language' — defaulting to 'auto'"
-        )
-        language = "auto"
-
-    language = normalize_language(language)
-
-    write_json(
-        metadata_path,
-        {
-            "session_id": session_id,
-            "client": str(ws.client),
-            "started_at_utc": session_started_at,
-            "backend": backend,
-            "language": language,
-            "client_sample_rate": client_sample_rate,
-            "server_sample_rate": cfg.sample_rate,
-            "audio_raw_pcm_path": str(raw_pcm_path),
-            "audio_wav_path": str(wav_path),
-            "events_path": str(events_path),
-            "status": "started",
-        },
-    )
-
-    if backend not in MODEL_MAP:
-        log.warning(f"Invalid backend requested: '{backend}'")
-
-        error_payload = {
-            "timestamp_utc": utc_now_iso(),
-            "session_id": session_id,
-            "type": "error",
-            "text": f"Unknown backend '{backend}'",
-            "language": language,
-        }
-
-        append_jsonl(events_path, error_payload)
-
-        await ws.send_text(
+        await ws.send(
             json.dumps(
                 {
-                    "type": "error",
-                    "text": f"Unknown backend '{backend}'",
-                    "session_id": session_id,
-                    "timestamp_utc": error_payload["timestamp_utc"],
-                }
-            )
-        )
-        await ws.close(code=4000)
-        return
-
-    try:
-        engine = get_engine(backend)
-    except ValueError as e:
-        log.error(str(e))
-
-        error_payload = {
-            "timestamp_utc": utc_now_iso(),
-            "session_id": session_id,
-            "type": "error",
-            "text": str(e),
-            "language": language,
-        }
-
-        append_jsonl(events_path, error_payload)
-
-        await ws.send_text(
-            json.dumps(
-                {
-                    "type": "error",
-                    "text": str(e),
-                    "session_id": session_id,
-                    "timestamp_utc": error_payload["timestamp_utc"],
-                }
-            )
-        )
-        await ws.close(code=4000)
-        return
-
-    engine.set_language(language)
-
-    log.info(
-        f"WS connected | session_id={session_id} backend={backend} "
-        f"language={language} client_sr={client_sample_rate} "
-        f"server_sr={cfg.sample_rate} client={ws.client}"
-    )
-
-    def upsample_if_needed(pcm: bytes) -> bytes:
-        if not pcm:
-            return pcm
-
-        if client_sample_rate == cfg.sample_rate:
-            return pcm
-
-        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        y = resampy.resample(x, client_sample_rate, cfg.sample_rate)
-        y = np.clip(y, -1.0, 1.0)
-
-        return (y * 32767.0).astype(np.int16).tobytes()
-
-    session = StreamingSession(engine, cfg)
-
-    try:
-        while True:
-            msg = await ws.receive()
-
-            if msg["type"] == "websocket.disconnect":
-                log.info(f"Client disconnected: {ws.client}")
-                break
-
-            # Text frame: EOF signal {"type": "eof"}
-            if msg.get("text"):
-                try:
-                    ctrl = json.loads(msg["text"])
-
-                    if ctrl.get("type") == "eof":
-                        log.info(
-                            f"EOF from {ws.client} — flushing last utterance | "
-                            f"session_id={session_id}"
-                        )
-
-                        loop = asyncio.get_running_loop()
-                        events = await loop.run_in_executor(
-                            None,
-                            session.flush,
-                        )
-
-                        for ev_type, text, ttfb in events:
-                            text = clean_model_leaked_tags(text)
-                            _log_transcript(
-                                ev_type,
-                                text,
-                                ttfb,
-                                language,
-                                ws.client,
-                            )
-
-                            event_payload = {
-                                "timestamp_utc": utc_now_iso(),
-                                "session_id": session_id,
-                                "type": ev_type,
-                                "text": text,
-                                "language": language,
-                                "ttfb_ms": ttfb,
-                            }
-
-                            transcript_events.append(event_payload)
-                            append_jsonl(events_path, event_payload)
-
-                            await ws.send_text(
-                                json.dumps(
-                                    {
-                                        "type": ev_type,
-                                        "text": text,
-                                        "t_start": ttfb,
-                                        "session_id": session_id,
-                                        "timestamp_utc": event_payload[
-                                            "timestamp_utc"
-                                        ],
-                                    }
-                                )
-                            )
-
-                        done_payload = {
-                            "timestamp_utc": utc_now_iso(),
-                            "session_id": session_id,
-                            "type": "done",
-                            "text": "",
-                            "language": language,
-                        }
-
-                        append_jsonl(events_path, done_payload)
-
-                        await ws.send_text(
-                            json.dumps(
-                                {
-                                    "type": "done",
-                                    "session_id": session_id,
-                                    "timestamp_utc": done_payload["timestamp_utc"],
-                                }
-                            )
-                        )
-
-                except (json.JSONDecodeError, AttributeError):
-                    pass
-
-                continue
-
-            data = msg.get("bytes")
-
-            if data is None:
-                continue
-
-            data = upsample_if_needed(data)
-
-            # Server-side audio capture
-            captured_pcm.extend(data)
-
-            with open(raw_pcm_path, "ab") as f:
-                f.write(data)
-
-            loop = asyncio.get_running_loop()
-            events = await loop.run_in_executor(
-                None,
-                session.process_chunk,
-                data,
-            )
-
-            for ev_type, text, ttfb in events:
-                text = clean_model_leaked_tags(text)
-                _log_transcript(
-                    ev_type,
-                    text,
-                    ttfb,
-                    language,
-                    ws.client,
-                )
-
-                event_payload = {
-                    "timestamp_utc": utc_now_iso(),
-                    "session_id": session_id,
-                    "type": ev_type,
-                    "text": text,
+                    "backend": "nemotron",
+                    "sample_rate": SAMPLE_RATE,
                     "language": language,
-                    "ttfb_ms": ttfb,
                 }
+            )
+        )
 
-                transcript_events.append(event_payload)
-                append_jsonl(events_path, event_payload)
+        first_chunk_sent_at = None
+        send_start = time.time()
+        send_end = None
 
-                await ws.send_text(
-                    json.dumps(
+        done_event = asyncio.Event()
+
+        async def receiver():
+            nonlocal partial_count
+            nonlocal final_count
+            nonlocal send_end
+
+            response_num = 0
+
+            try:
+                async for raw in ws:
+                    if isinstance(raw, bytes):
+                        continue
+
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    now = time.time()
+                    ev_type = msg.get("type", "")
+                    text = clean_text(msg.get("text", ""))
+                    t_start = msg.get("t_start")
+                    server_session_id = msg.get("session_id")
+                    server_timestamp_utc = msg.get("timestamp_utc")
+
+                    if ev_type == "done":
+                        done_event.set()
+                        break
+
+                    if ev_type == "error":
+                        response_num += 1
+
+                        response_events.append(
+                            {
+                                "response_num": response_num,
+                                "type": "error",
+                                "text": text,
+                                "timestamp": datetime.now().isoformat(),
+                                "server_session_id": server_session_id,
+                                "server_timestamp_utc": server_timestamp_utc,
+                                "latency_from_start_ms": (
+                                    now - connection_start
+                                )
+                                * 1000,
+                                "latency_from_send_start_ms": (
+                                    now - send_start
+                                )
+                                * 1000,
+                                "latency_from_first_chunk_ms": (
+                                    (now - first_chunk_sent_at) * 1000
+                                    if first_chunk_sent_at
+                                    else None
+                                ),
+                                "latency_from_send_end_ms": (
+                                    (now - send_end) * 1000
+                                    if send_end
+                                    else None
+                                ),
+                                "is_final": False,
+                                "words": 0,
+                                "char_count": 0,
+                                "server_t_start": t_start,
+                            }
+                        )
+
+                        continue
+
+                    if ev_type not in {"partial", "final"}:
+                        continue
+
+                    response_num += 1
+
+                    if ev_type == "partial":
+                        partial_count += 1
+
+                    if ev_type == "final":
+                        final_count += 1
+                        if text:
+                            final_texts.append(text)
+
+                    response_events.append(
                         {
+                            "response_num": response_num,
                             "type": ev_type,
+                            "latency_from_start_ms": (
+                                now - connection_start
+                            )
+                            * 1000,
+                            "latency_from_send_start_ms": (
+                                now - send_start
+                            )
+                            * 1000,
+                            "latency_from_first_chunk_ms": (
+                                (now - first_chunk_sent_at) * 1000
+                                if first_chunk_sent_at
+                                else None
+                            ),
+                            "latency_from_send_end_ms": (
+                                (now - send_end) * 1000
+                                if send_end
+                                else None
+                            ),
+                            "is_final": ev_type == "final",
+                            "words": len(text.split()),
+                            "char_count": len(text),
+                            "server_t_start": t_start,
+                            "server_session_id": server_session_id,
+                            "server_timestamp_utc": server_timestamp_utc,
                             "text": text,
-                            "t_start": ttfb,
-                            "session_id": session_id,
-                            "timestamp_utc": event_payload["timestamp_utc"],
+                            "timestamp": datetime.now().isoformat(),
                         }
                     )
+
+            except Exception as e:
+                response_events.append(
+                    {
+                        "response_num": len(response_events) + 1,
+                        "type": "client_receive_error",
+                        "text": str(e),
+                        "timestamp": datetime.now().isoformat(),
+                        "is_final": False,
+                        "words": 0,
+                        "char_count": 0,
+                    }
                 )
 
-    except Exception:
-        log.exception(f"Error during WebSocket session for {ws.client}")
+                done_event.set()
 
-    finally:
-        session_ended_at = utc_now_iso()
-        session_end_perf = asyncio.get_running_loop().time()
-        wall_duration_sec = session_end_perf - session_start_perf
+        recv_task = asyncio.create_task(receiver())
 
-        audio_duration_sec = 0.0
-        if captured_pcm:
-            audio_duration_sec = len(captured_pcm) / 2 / cfg.sample_rate
+        for i, chunk in enumerate(chunks):
+            if first_chunk_sent_at is None:
+                first_chunk_sent_at = time.time()
+
+            await ws.send(chunk)
+
+            if realtime:
+                expected_elapsed = (i + 1) * CHUNK_MS / 1000.0
+                actual_elapsed = time.time() - send_start
+                sleep_for = expected_elapsed - actual_elapsed
+
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+            else:
+                await asyncio.sleep(0.001)
+
+        send_end = time.time()
+        send_duration_sec = send_end - send_start
+
+        await ws.send(json.dumps({"type": "eof"}))
 
         try:
-            save_pcm_as_wav(
-                pcm_bytes=bytes(captured_pcm),
-                wav_path=wav_path,
-                sample_rate=cfg.sample_rate,
+            await asyncio.wait_for(
+                done_event.wait(),
+                timeout=receive_timeout_sec,
             )
-        except Exception:
-            log.exception(f"Failed to save WAV for session_id={session_id}")
+        except asyncio.TimeoutError:
+            print(
+                f"[warn] Timeout waiting for done event after EOF: {wav_path.name}"
+            )
 
-        final_metadata = {
-            "session_id": session_id,
-            "client": str(ws.client),
-            "started_at_utc": session_started_at,
-            "ended_at_utc": session_ended_at,
-            "wall_duration_sec": round(wall_duration_sec, 3),
-            "audio_duration_sec": round(audio_duration_sec, 3),
-            "backend": backend,
-            "language": language,
-            "client_sample_rate": client_sample_rate,
-            "server_sample_rate": cfg.sample_rate,
-            "raw_pcm_bytes": len(captured_pcm),
-            "audio_raw_pcm_path": str(raw_pcm_path),
-            "audio_wav_path": str(wav_path),
-            "events_path": str(events_path),
-            "final_transcripts": [
-                ev["text"]
-                for ev in transcript_events
-                if ev.get("type") == "final" and ev.get("text")
-            ],
-            "status": "completed",
-        }
+        recv_task.cancel()
 
-        write_json(metadata_path, final_metadata)
+        try:
+            await recv_task
+        except asyncio.CancelledError:
+            pass
 
-        log.info(
-            f"AUDIO_LOG_END | session_id={session_id} client={ws.client} "
-            f"wall_duration_sec={wall_duration_sec:.3f} "
-            f"audio_duration_sec={audio_duration_sec:.3f} "
-            f"wav={wav_path}"
+    total_processing_time_sec = time.time() - connection_start
+
+    # Important:
+    # transcript.txt is generated line-by-line.
+    # Each final ASR segment becomes one line.
+    transcript = "\n".join(t.strip() for t in final_texts if t.strip())
+
+    first_response = response_events[0] if response_events else None
+    first_final = next((x for x in response_events if x.get("is_final")), None)
+
+    first_response_latency_sec = (
+        first_response["latency_from_start_ms"] / 1000
+        if first_response
+        else None
+    )
+
+    first_final_latency_sec = (
+        first_final["latency_from_start_ms"] / 1000
+        if first_final
+        else None
+    )
+
+    first_byte_latency_sec = first_response_latency_sec
+
+    timing_metrics = {
+        "connection_time_sec": connection_time_sec,
+        "send_duration_sec": send_duration_sec,
+        "first_byte_latency_sec": first_byte_latency_sec,
+        "first_response_latency_sec": first_response_latency_sec,
+        "first_final_latency_sec": first_final_latency_sec,
+        "time_to_first_chunk_sec": (
+            first_chunk_sent_at - connection_start
+            if first_chunk_sent_at
+            else None
+        ),
+    }
+
+    reference_text = ""
+    accuracy_metrics = None
+
+    if reference_path and reference_path.exists():
+        reference_text = reference_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
         )
 
-        log.info(f"WS session closed for {ws.client}")
+        accuracy_metrics = calculate_wer_cer_ser(
+            reference_text=reference_text,
+            hypothesis_text=transcript,
+        )
+
+    result = {
+        "audio_file": str(original_audio_path),
+        "converted_wav_file": str(wav_path),
+        "reference_file": str(reference_path) if reference_path else None,
+        "audio_duration_sec": audio_duration_sec,
+        "total_processing_time_sec": total_processing_time_sec,
+        "rtf": (
+            total_processing_time_sec / audio_duration_sec
+            if audio_duration_sec > 0
+            else None
+        ),
+        "timestamp": datetime.now().isoformat(),
+        "model": MODEL_NAME,
+        "language": language,
+        "server_url": url,
+        "realtime": realtime,
+        "timing_metrics": timing_metrics,
+        "summary": {
+            "partial_count": partial_count,
+            "final_count": final_count,
+            "total_response_count": len(response_events),
+            "transcript_lines": len(
+                [x for x in transcript.splitlines() if x.strip()]
+            ),
+            "transcript_words": len(transcript.split()),
+            "transcript_chars": len(transcript),
+        },
+        "accuracy_metrics": accuracy_metrics,
+        "latencies": response_events,
+    }
+
+    return {
+        "result": result,
+        "transcript": transcript,
+        "reference_text": reference_text,
+    }
 
 
-def _log_transcript(ev_type: str, text: str, ttfb_ms, language: str, client):
-    if not text:
-        return
+# ---------------------------------------------------------------------
+# File matching
+# ---------------------------------------------------------------------
+def find_reference_for_audio(audio_path: Path) -> Optional[Path]:
+    """
+    maria1.mp3 -> maria1_reference.text
+    """
 
-    if ev_type == "partial":
-        log.debug(f"PARTIAL | lang={language} client={client} | {text}")
+    ref_name = f"{audio_path.stem}_reference.text"
+    ref_path = REF_DIR / ref_name
 
-    elif ev_type == "final":
-        ttfb_str = f" ttfb={ttfb_ms}ms" if ttfb_ms is not None else ""
-        log.info(f"FINAL   | lang={language} client={client}{ttfb_str} | {text}")
+    if ref_path.exists():
+        return ref_path
+
+    return None
+
+
+# ---------------------------------------------------------------------
+# Main benchmark runner
+# ---------------------------------------------------------------------
+async def run_benchmark(args):
+    ensure_dirs()
+
+    if args.download:
+        download_inputs()
+
+    audio_files = sorted(AUDIO_DIR.glob("maria*.mp3"))
+
+    if args.limit:
+        audio_files = audio_files[: args.limit]
+
+    if not audio_files:
+        raise RuntimeError(f"No maria*.mp3 files found in {AUDIO_DIR}")
+
+    print(f"\nFound {len(audio_files)} maria audio files.")
+
+    for idx, audio_path in enumerate(audio_files, start=1):
+        print("\n" + "=" * 80)
+        print(f"[{idx}/{len(audio_files)}] Benchmarking: {audio_path.name}")
+        print("=" * 80)
+
+        reference_path = find_reference_for_audio(audio_path)
+
+        if reference_path:
+            print(f"Reference: {reference_path.name}")
+        else:
+            print(f"[warn] No reference found for {audio_path.name}")
+
+        wav_path = convert_mp3_to_wav_16k_mono(audio_path)
+
+        output_prefix = audio_path.stem
+
+        latency_out = OUT_DIR / f"{output_prefix}_latencies.json"
+        transcript_out = OUT_DIR / f"{output_prefix}_transcript.txt"
+
+        benchmark = await benchmark_one_audio(
+            wav_path=wav_path,
+            original_audio_path=audio_path,
+            reference_path=reference_path,
+            language=args.language,
+            url=args.url,
+            realtime=args.realtime,
+            receive_timeout_sec=args.receive_timeout,
+        )
+
+        latency_out.write_text(
+            json.dumps(
+                benchmark["result"],
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        transcript_out.write_text(
+            benchmark["transcript"],
+            encoding="utf-8",
+        )
+
+        acc = benchmark["result"].get("accuracy_metrics")
+
+        if acc:
+            print(
+                f"WER={acc['wer_percent']:.2f}% "
+                f"CER={acc['cer_percent']:.2f}% "
+                f"SER={acc['ser_percent']:.2f}%"
+            )
+
+        print(f"Saved: {latency_out}")
+        print(f"Saved: {transcript_out}")
+
+    if args.upload:
+        print("\nUploading result files to GCS...")
+        gcs_upload_dir(OUT_DIR, RESULT_GCS)
+        print(f"Uploaded to: {RESULT_GCS}/")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Benchmark Nemotron 3.5 ASR on maria*.mp3 files from GCS"
+    )
+
+    parser.add_argument(
+        "--url",
+        default=DEFAULT_WS_URL,
+        help=f"Nemotron WebSocket URL. Default: {DEFAULT_WS_URL}",
+    )
+
+    parser.add_argument(
+        "--language",
+        default="auto",
+        help="Language: auto, en-US, es-US. Default: auto",
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=15,
+        help="Number of maria*.mp3 files to benchmark. Default: 15",
+    )
+
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help="Send chunks in real-time pacing. Default is fast mode.",
+    )
+
+    parser.add_argument(
+        "--receive-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for done after EOF. Default: 120",
+    )
+
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        default=True,
+        help="Download audios/references from GCS. Default: true",
+    )
+
+    parser.add_argument(
+        "--no-download",
+        dest="download",
+        action="store_false",
+        help="Skip GCS download and use local benchmark_workspace files.",
+    )
+
+    parser.add_argument(
+        "--upload",
+        action="store_true",
+        default=True,
+        help="Upload result files to GCS. Default: true",
+    )
+
+    parser.add_argument(
+        "--no-upload",
+        dest="upload",
+        action="store_false",
+        help="Skip GCS upload.",
+    )
+
+    args = parser.parse_args()
+
+    asyncio.run(run_benchmark(args))
+
+
+if __name__ == "__main__":
+    main()
