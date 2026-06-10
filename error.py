@@ -570,3 +570,8 @@ def _log_transcript(ev_type: str, text: str, ttfb_ms, language: str, client):
     elif ev_type == "final":
         ttfb_str = f" ttfb={ttfb_ms}ms" if ttfb_ms is not None else ""
         log.info(f"FINAL   | lang={language} client={client}{ttfb_str} | {text}")
+
+
+
+  log-audio and timestamps, duration.
+Share VAD Options
