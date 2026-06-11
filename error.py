@@ -861,3 +861,53 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+(azure_test_env) PS C:\Users\re_nikitav\Documents\azure_benchmarking> python .\deepgram_python_sdk.py --mode file --file "C:/Users/re_nikitav/Documents/azure_benchmarking/audio/cartesia_audio.wav" --force
+======================================================================
+Deepgram Nova-3 SDK Streaming - FILE MODE
+======================================================================
+Files found: 1
+Output Directory: deepgram-nova-3
+
+----------------------------------------------------------------------
+Processing [1/1]: C:/Users/re_nikitav/Documents/azure_benchmarking/audio/cartesia_audio.wav
+----------------------------------------------------------------------
+  Audio: 44100Hz, 1ch, 42.24s
+Traceback (most recent call last):
+  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 863, in <module>
+    asyncio.run(main())
+    ~~~~~~~~~~~^^^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 856, in main
+    await run_file_mode(args.file, force=args.force)
+  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 778, in run_file_mode
+    result = await stream_wav_file(audio_file)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 510, in stream_wav_file
+    connection = start_deepgram_connection(
+        state=state,
+        sample_rate=audio_info["sample_rate"],
+        channels=audio_info["channels"],
+    )
+  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 422, in start_deepgram_connection
+    connection = client.listen.v1.connect(
+        model="nova-3",
+    ...<9 lines>...
+        channels=str(channels),
+    )
+  File "C:\Program Files\Python313\Lib\contextlib.py", line 305, in helper
+    return _GeneratorContextManager(func, args, kwds)
+  File "C:\Program Files\Python313\Lib\contextlib.py", line 109, in __init__
+    self.gen = func(*args, **kwds)
+               ~~~~^^^^^^^^^^^^^^^
+TypeError: V1Client.connect() got an unexpected keyword argument 'no_delay'
