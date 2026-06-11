@@ -1346,13 +1346,5 @@ if __name__ == "__main__":
 
 
 
-C:\Users\re_nikitav\AppData\Local\Google\Cloud SDK>gcloud compute scp C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\benchmark_maria_nemotron.py nikita_verma2@cx-asr-test:/home/nikita_verma2/ --zone=us-central1-a --project=emr-dgt-autonomous-uctr1-snbx
-WARNING: The private SSH key file for gcloud does not exist.
-WARNING: The public SSH key file for gcloud does not exist.
-WARNING: The PuTTY PPK SSH key file for gcloud does not exist.
-WARNING: You do not have an SSH key for gcloud.
-WARNING: SSH keygen will be executed to generate a key.
-Updating project ssh metadata...failed.
-Updating instance ssh metadata...|Updated [https://www.googleapis.com/compute/v1/projects/emr-dgt-autonomous-uctr1-snbx/zones/us-central1-a/instances/cx-asr-test].
-Updating instance ssh metadata...done.
-Waiting for SSH key to propagate.
+gcloud compute ssh nikita_verma2@cx-asr-test --zone=us-central1-a --project=emr-dgt-autonomous-uctr1-snbx
+gcloud compute scp C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\benchmark_maria_nemotron.py nikita_verma2@cx-asr-test:/home/nikita_verma2/ --zone=us-central1-a --project=emr-dgt-autonomous-uctr1-snbx --tunnel-through-iap
