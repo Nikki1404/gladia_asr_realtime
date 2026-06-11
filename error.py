@@ -16,8 +16,8 @@ from deepgram.core.events import EventType
 
 DEEPGRAM_API_KEY = "deepgram_api_key"
 
-if not DEEPGRAM_API_KEY or DEEPGRAM_API_KEY == "your_deepgram_api_key_here":
-    raise ValueError("Please add your Deepgram API key in DEEPGRAM_API_KEY")
+if not DEEPGRAM_API_KEY or DEEPGRAM_API_KEY in {"your_deepgram_api_key_here", "deepgram_api_key"}:
+    raise ValueError("Please add your actual Deepgram API key in DEEPGRAM_API_KEY")
 
 OUTPUT_DIR = "deepgram-nova-3"
 
@@ -261,7 +261,10 @@ def normalize_numeric_phrases_context_aware(text):
 
 # AUDIO HELPERS
 def get_wav_info(audio_path):
-    with wave.open(audio_path, "rb") as wf:
+    # wave.open on Windows can treat pathlib.WindowsPath as a file-like object
+    # and fail with: 'WindowsPath' object has no attribute 'read'.
+    # Convert Path objects to string before opening.
+    with wave.open(str(audio_path), "rb") as wf:
         sample_rate = wf.getframerate()
         channels = wf.getnchannels()
         sample_width = wf.getsampwidth()
@@ -516,7 +519,7 @@ async def stream_wav_file(audio_path):
     send_start = time.time()
 
     try:
-        with open(audio_path, "rb") as audio_file:
+        with open(str(audio_path), "rb") as audio_file:
             audio_file.seek(44)
 
             bytes_per_sample = audio_info["sample_width"]
@@ -550,6 +553,8 @@ async def stream_wav_file(audio_path):
 
     except Exception as e:
         print(f"  File streaming error: {e}")
+        import traceback
+        traceback.print_exc()
 
     result = finalize_state(state)
     print(f"  Total processing time: {result['total_time']:.3f}s")
@@ -737,7 +742,7 @@ def save_results(result, output_dir):
 
 # MAIN
 
-async def run_file_mode(file_pattern):
+async def run_file_mode(file_pattern, force=False):
     files = sorted(glob.glob(file_pattern))
 
     if not files:
@@ -764,8 +769,9 @@ async def run_file_mode(file_pattern):
         transcript_file = Path(OUTPUT_DIR) / f"{audio_name}_transcript.txt"
         latency_file = Path(OUTPUT_DIR) / f"{audio_name}_latencies.json"
 
-        if transcript_file.exists() and latency_file.exists():
+        if transcript_file.exists() and latency_file.exists() and not force:
             print("✓ SKIPPED - Already processed")
+            print("  Use --force to reprocess this file")
             skipped_count += 1
             continue
 
@@ -834,6 +840,12 @@ def parse_args():
         help="Mic recording duration in seconds. If not passed, runs until Ctrl+C",
     )
 
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess file even if transcript and latency outputs already exist",
+    )
+
     return parser.parse_args()
 
 
@@ -841,7 +853,7 @@ async def main():
     args = parse_args()
 
     if args.mode == "file":
-        await run_file_mode(args.file)
+        await run_file_mode(args.file, force=args.force)
 
     elif args.mode == "mic":
         await run_mic_mode(args.duration)
@@ -849,35 +861,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-#pip install deepgram-sdk sounddevice
-#if sounddevice doesn't work then 
-# sudo apt-get install -y libportaudio2
-#python deepgram_sdk_client.py
-
-
-(azure_test_env) PS C:\Users\re_nikitav\Documents\azure_benchmarking> python .\deepgram_python_sdk.py --mode file C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
-usage: deepgram_python_sdk.py [-h] --mode {file,mic} [--file FILE] [--duration DURATION]
-deepgram_python_sdk.py: error: unrecognized arguments: C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
-
-(azure_test_env) PS C:\Users\re_nikitav\Documents\azure_benchmarking> python .\deepgram_python_sdk.py --mode file --file C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
-======================================================================
-Deepgram Nova-3 SDK Streaming - FILE MODE
-======================================================================
-Files found: 1
-Output Directory: deepgram-nova-3
-
-----------------------------------------------------------------------
-Processing [1/1]: C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
-----------------------------------------------------------------------
-✓ SKIPPED - Already processed
-======================================================================
-File Mode Complete
-======================================================================
-Total files: 1
-Processed: 0
-Skipped: 1
-Failed: 0
-======================================================================
