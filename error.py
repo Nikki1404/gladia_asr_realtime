@@ -1087,3 +1087,44 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+================================================================================
+[14/15] Benchmarking: maria31.mp3
+================================================================================
+Reference: maria31_reference.txt
+[cmd] ffmpeg -y -i benchmark_workspace/audios/maria31.mp3 -ac 1 -ar 16000 -sample_fmt s16 -f segment -segment_time 300 -reset_timestamps 1 benchmark_workspace/segments_16k/maria31/maria31_part_%04d.wav
+ffmpeg version 5.1.9-0+deb12u1 Copyright (c) 2000-2026 the FFmpeg developers
+  built with gcc 12 (Debian 12.2.0-14+deb12u1)
+  configuration: --prefix=/usr --extra-version=0+deb12u1 --toolchain=hardened --libdir=/usr/lib/x86_64-linux-gnu --incdir=/usr/include/x86_64-linux-gnu --arch=amd64 --enable-gpl --disable-stripping --enable-gnutls --enable-ladspa --enable-libaom --enable-libass --enable-libbluray --enable-libbs2b --enable-libcaca --enable-libcdio --enable-libcodec2 --enable-libdav1d --enable-libflite --enable-libfontconfig --enable-libfreetype --enable-libfribidi --enable-libglslang --enable-libgme --enable-libgsm --enable-libjack --enable-libmp3lame --enable-libmysofa --enable-libopenjpeg --enable-libopenmpt --enable-libopus --enable-libpulse --enable-librabbitmq --enable-librist --enable-librubberband --enable-libshine --enable-libsnappy --enable-libsoxr --enable-libspeex --enable-libsrt --enable-libssh --enable-libsvtav1 --enable-libtheora --enable-libtwolame --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx265 --enable-libxml2 --enable-libxvid --enable-libzimg --enable-libzmq --enable-libzvbi --enable-lv2 --enable-omx --enable-openal --enable-opencl --enable-opengl --enable-sdl2 --disable-sndio --enable-libjxl --enable-pocketsphinx --enable-librsvg --enable-libmfx --enable-libdc1394 --enable-libdrm --enable-libiec61883 --enable-chromaprint --enable-frei0r --enable-libx264 --enable-libplacebo --enable-librav1e --enable-shared
+  libavutil      57. 28.100 / 57. 28.100
+  libavcodec     59. 37.100 / 59. 37.100
+  libavformat    59. 27.100 / 59. 27.100
+  libavdevice    59.  7.100 / 59.  7.100
+  libavfilter     8. 44.100 /  8. 44.100
+  libswscale      6.  7.100 /  6.  7.100
+  libswresample   4.  7.100 /  4.  7.100
+  libpostproc    56.  6.100 / 56.  6.100
+[mp3 @ 0x55ab597a8940] Estimating duration from bitrate, this may be inaccurate
+Input #0, mp3, from 'benchmark_workspace/audios/maria31.mp3':
+  Duration: 01:45:40.94, start: 0.000000, bitrate: 128 kb/s
+  Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 128 kb/s
+Stream mapping:
+  Stream #0:0 -> #0:0 (mp3 (mp3float) -> pcm_s16le (native))
+Press [q] to stop, [?] for help
+[segment @ 0x55ab597acb80] Opening 'benchmark_workspace/segments_16k/maria31/maria31_part_0000.wav' for writing
+Output #0, segment, to 'benchmark_workspace/segments_16k/maria31/maria31_part_%04d.wav':
+  Metadata:
+    encoder         : Lavf59.27.100
+  Stream #0:0: Audio: pcm_s16le, 16000 Hz, mono, s16, 256 kb/s
+    Metadata:
+      encoder         : Lavc59.37.100 pcm_s16le
+size=N/A time=00:00:00.02 bitrate=N/A speed=N/A    
+size=N/A time=00:04:43.74 bitrate=N/A speed= 567x    
+[segment @ 0x55ab597acb80] Opening 'benchmark_workspace/segments_16k/maria31/maria31_part_0001.wav' for writing
+size=N/A time=00:09:29.12 bitrate=N/A speed= 569x    
+[segment @ 0x55ab597acb80] Opening 'benchmark_workspace/segments_16k/maria31/maria31_part_0002.wav' for writing
+size=N/A time=00:14:28.75 bitrate=N/A speed= 579x    
+[segment @ 0x55ab597acb80] Opening 'benchmark_workspace/segments_16k/maria31/maria31_part_0003.wav' for writing
+size=N/A time=00:19:08.94 bitrate=N/A speed= 574x
