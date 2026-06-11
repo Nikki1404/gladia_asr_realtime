@@ -1345,7 +1345,8 @@ if __name__ == "__main__":
     main()
 
 
-C:\Users\re_nikitav\AppData\Local\Google\Cloud SDK>gcloud compute instances list
-NAME           ZONE           MACHINE_TYPE                   PREEMPTIBLE  INTERNAL_IP  EXTERNAL_IP  STATUS
-gc07-e01-citl  us-central1-c  custom (e2, 2 vCPU, 4.00 GiB)               10.152.46.6               TERMINATED
-gc07-e01-tfcx  us-central1-c  custom (e2, 2 vCPU, 4.00 GiB)               10.152.46.5               RUNNING
+C:\Users\re_nikitav\AppData\Local\Google\Cloud SDK>gcloud projects list
+PROJECT_ID                     NAME                           PROJECT_NUMBER  ENVIRONMENT
+eci-ugi-digital-ccaipoc        eci-ugi-digital-CCAIPOC        543091104373
+emr-dgt-autonomous-uctr1-dev   emr-dgt-autonomous-uctr1-dev   699761710703
+emr-dgt-autonomous-uctr1-snbx  emr-dgt-autonomous-uctr1-snbx  150916788856
