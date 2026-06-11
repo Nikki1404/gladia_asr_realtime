@@ -1344,4 +1344,13 @@ def main():
 if __name__ == "__main__":
     main()
 
+nikita_verma2@cx-asr-test:~$ df -h
+Filesystem       Size  Used Avail Use% Mounted on
+udev             7.9G     0  7.9G   0% /dev
+tmpfs            1.6G  780K  1.6G   1% /run
+/dev/nvme0n1p1    99G   97G     0 100% /
+tmpfs            7.9G     0  7.9G   0% /dev/shm
+tmpfs            5.0M     0  5.0M   0% /run/lock
+/dev/nvme0n1p15  124M   12M  113M  10% /boot/efi
+tmpfs            1.6G     0  1.6G   0% /run/user/
 
