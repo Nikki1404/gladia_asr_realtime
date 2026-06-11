@@ -1345,24 +1345,7 @@ if __name__ == "__main__":
     main()
 
 
-nikita_verma2@cx-asr-test:~$ du -sh /* 2>/dev/null | sort -rh | head -20
-7.0G    /home
-4.2G    /usr
-599M    /var
-435M    /opt
-81M     /boot
-5.1M    /etc
-644K    /run
-20K     /tmp
-16K     /lost+found
-4.0K    /srv
-4.0K    /root
-4.0K    /mnt
-4.0K    /media
-0       /sys
-0       /sbin
-0       /proc
-0       /lib64
-0       /lib
-0       /dev
-0       /bin
+C:\Users\re_nikitav\AppData\Local\Google\Cloud SDK>gcloud compute instances list
+NAME           ZONE           MACHINE_TYPE                   PREEMPTIBLE  INTERNAL_IP  EXTERNAL_IP  STATUS
+gc07-e01-citl  us-central1-c  custom (e2, 2 vCPU, 4.00 GiB)               10.152.46.6               TERMINATED
+gc07-e01-tfcx  us-central1-c  custom (e2, 2 vCPU, 4.00 GiB)               10.152.46.5               RUNNING
