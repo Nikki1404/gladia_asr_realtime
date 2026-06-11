@@ -1343,3 +1343,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+nikita_verma2@cx-asr-test:~$ gcloud compute instances list 
+WARNING: Could not setup log file in /home/nikita_verma2/.config/gcloud/logs, (OSError: [Errno 28] No space left on device: '/home/nikita_verma2/.config'.
+The configuration directory may not be writable. To learn more, see https://cloud.google.com/sdk/docs/configurations#creating_a_configuration
+ERROR: gcloud crashed (OSError): [Errno 28] No space left on device: '/home/nikita_verma2/.config'
+
+If you would like to report this issue, please run the following command:
+  gcloud feedback
+
+To check gcloud for common problems, please run the following command:
+  gcloud info --run-diagnostics
