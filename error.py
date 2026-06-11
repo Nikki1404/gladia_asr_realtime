@@ -1,1348 +1,694 @@
-#!/usr/bin/env python3
-"""
-benchmark_maria_nemotron.py
+Nikita Verma suggest the changes as per the python sdk - 
+ 
+https://github.com/deepgram/deepgram-python-sdk?tab=readme-ov-file#installation
 
-Benchmarks Nemotron 3.5 ASR WebSocket server on maria*.mp3 files from GCS.
 
-Workflow in this fixed version:
-  1. Find audio files in benchmark_workspace/audios/
-  2. If --remaining-only is used, run only audios missing final result:
-       maria*_transcript.txt OR maria*_latencies.json
-  3. Convert each remaining MP3 to one full 16kHz mono PCM16 WAV
-  4. Split the full WAV into 5-minute segments by default
-  5. Transcribe every segment through WebSocket
-  6. Combine all segment transcripts into one paragraph
-  7. Save one maria*_transcript.txt and one maria*_latencies.json per original audio
-  8. Upload result files to gs://cx-asr-test-data/results/nemotron_3.5/
+i was asked to do this ..
 
-Inputs:
-  gs://cx-asr-test-data/audios/maria*.mp3
-  gs://cx-asr-test-data/references/maria*_reference.txt
+similarly i have done numeric handling in this client so could you suggest  the changes as per the python sdk - (https://github.com/deepgram/deepgram-python-sdk?tab=readme-ov-file#installation)
+ 
 
-Outputs per original audio:
-  maria*_latencies.json
-  maria*_transcript.txt
 
-If an audio fails:
-  maria*_error.json
-
-Recommended run for remaining files only:
-  nohup python benchmark_maria_nemotron.py \
-    --remaining-only \
-    --no-download \
-    --realtime \
-    --segment-seconds 300 \
-    --receive-timeout 1200 \
-    > nemotron_remaining_full.log 2>&1 &
-
-Clean rerun for remaining files only:
-  nohup python benchmark_maria_nemotron.py \
-    --remaining-only \
-    --no-download \
-    --realtime \
-    --segment-seconds 300 \
-    --receive-timeout 1200 \
-    --force-wav \
-    --force-split \
-    > nemotron_remaining_clean.log 2>&1 &
-"""
-
-import argparse
-import asyncio
+this is my client 
+import os
 import json
-import re
-import shutil
-import subprocess
-import sys
-import time
-import wave
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
+import asyncio
 import websockets
+import wave
+import time
+import glob
+import re
+from pathlib import Path
+from datetime import datetime
 
+# =====================
+# CONFIG
+# =====================
 
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
-DEFAULT_WS_URL = "ws://35.254.200.29:8003/asr/realtime-custom-vad"
+DEEPGRAM_API_KEY = "5c6e335e937a1b8ded48e7ed2fba525f65b03315"
 
-AUDIO_GCS = "gs://cx-asr-test-data/audios"
-REFERENCE_GCS = "gs://cx-asr-test-data/references"
-RESULT_GCS = "gs://cx-asr-test-data/results/nemotron_3.5"
+# Audio files to test
+AUDIO_FILES = sorted(glob.glob("audio/car*.wav"))
 
-MODEL_NAME = "nemotron-3.5-asr-streaming-0.6b"
+# Output directory
+OUTPUT_DIR = "deepgram-nova-3"
 
-SAMPLE_RATE = 16000
-CHUNK_MS = 100
-CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_MS / 1000) * 2
+DIGIT_WORDS = {
+    "zero": "0", "oh": "0", "o": "0",
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9"
+}
 
-WORK_DIR = Path("benchmark_workspace")
-AUDIO_DIR = WORK_DIR / "audios"
-REF_DIR = WORK_DIR / "references"
-WAV_DIR = WORK_DIR / "wav_16k"
-SEGMENT_DIR = WORK_DIR / "segments_16k"
-OUT_DIR = WORK_DIR / "results" / "nemotron_3.5"
+REPEAT_WORDS = {
+    "double": 2,
+    "triple": 3,
+    "quadruple": 4,
+    "quintuple": 5
+}
 
-_LANG_TAG_RE = re.compile(r"<[a-z]{2}-[A-Z]{2}>\s*")
+NUMBER_WORDS = {
+    "zero": 0, "oh": 0, "o": 0,
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90
+}
 
+MAGNITUDE_WORDS = {"hundred", "thousand", "lakh", "million"}
 
-# ---------------------------------------------------------------------
-# Basic helpers
-# ---------------------------------------------------------------------
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    return _LANG_TAG_RE.sub("", text).strip()
+NUMERIC_CUE_WORDS = {
+    "number", "numbers", "digit", "digits", "code", "otp", "pin", "passcode",
+    "id", "account", "reference", "ticket", "invoice", "amount", "mobile",
+    "phone", "contact", "serial", "zip", "postcode", "address", "plate",
+    "card", "cvv", "expiry", "transaction"
+}
 
+NON_NUMERIC_FOLLOW_WORDS = {
+    "time", "times", "day", "days", "week", "weeks", "month", "months",
+    "year", "years", "person", "people", "thing", "things", "way"
+}
 
-def ensure_dirs():
-    for d in [AUDIO_DIR, REF_DIR, WAV_DIR, SEGMENT_DIR, OUT_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
+# =====================
+# NUMERIC NORMALIZATION
+# =====================
 
+def spoken_number_to_int(tokens):
+    if not tokens:
+        return None
 
-def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
-    print("[cmd]", " ".join(cmd), flush=True)
+    total = 0
+    current = 0
+    used = False
 
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    for token in tokens:
+        t = token.lower()
 
-    if result.stdout:
-        print(result.stdout, flush=True)
-
-    if result.stderr:
-        # ffmpeg progress usually comes on stderr; keep it visible in log.
-        print(result.stderr, file=sys.stderr, flush=True)
-
-    if check and result.returncode != 0:
-        raise RuntimeError(f"Command failed with returncode={result.returncode}: {' '.join(cmd)}")
-
-    return result
-
-
-def find_storage_cli() -> str:
-    if shutil.which("gcloud"):
-        return "gcloud"
-
-    if shutil.which("gsutil"):
-        return "gsutil"
-
-    raise RuntimeError("Neither gcloud nor gsutil found. Install Google Cloud SDK first.")
-
-
-def gcs_cp_many(src_pattern: str, dst_dir: Path):
-    cli = find_storage_cli()
-
-    if cli == "gcloud":
-        run_cmd(["gcloud", "storage", "cp", src_pattern, str(dst_dir)])
-    else:
-        run_cmd(["gsutil", "-m", "cp", src_pattern, str(dst_dir)])
-
-
-def gcs_upload_dir(src_dir: Path, dst_gcs: str):
-    cli = find_storage_cli()
-
-    if cli == "gcloud":
-        run_cmd(["gcloud", "storage", "cp", f"{src_dir}/*", f"{dst_gcs}/"])
-    else:
-        run_cmd(["gsutil", "-m", "cp", f"{src_dir}/*", f"{dst_gcs}/"])
-
-
-def gcs_upload_files(files: List[Path], dst_gcs: str):
-    cli = find_storage_cli()
-
-    for file_path in files:
-        if not file_path.exists():
-            print(f"[warn] File not found, skipping upload: {file_path}", flush=True)
+        if t == "and":
             continue
-
-        if cli == "gcloud":
-            run_cmd(["gcloud", "storage", "cp", str(file_path), f"{dst_gcs}/"])
+        elif t in NUMBER_WORDS:
+            current += NUMBER_WORDS[t]
+            used = True
+        elif t == "hundred":
+            if current == 0:
+                current = 1
+            current *= 100
+            used = True
+        elif t == "thousand":
+            if current == 0:
+                current = 1
+            total += current * 1000
+            current = 0
+            used = True
+        elif t == "lakh":
+            if current == 0:
+                current = 1
+            total += current * 100000
+            current = 0
+            used = True
+        elif t == "million":
+            if current == 0:
+                current = 1
+            total += current * 1000000
+            current = 0
+            used = True
         else:
-            run_cmd(["gsutil", "cp", str(file_path), f"{dst_gcs}/"])
+            return None
 
+    return total + current if used else None
 
-def download_inputs():
-    ensure_dirs()
 
-    print("\nDownloading maria*.mp3 audios...", flush=True)
-    gcs_cp_many(f"{AUDIO_GCS}/maria*.mp3", AUDIO_DIR)
+def tokenize_text(text):
+    return re.findall(r"\d+|[A-Za-z]+|[^\w\s]", text)
 
-    print("\nDownloading maria*_reference.txt references...", flush=True)
-    gcs_cp_many(f"{REFERENCE_GCS}/maria*_reference.txt", REF_DIR)
 
+def is_word_token(tok):
+    return re.fullmatch(r"[A-Za-z]+", tok or "") is not None
 
-def natural_key(path: Path):
-    return [
-        int(x) if x.isdigit() else x.lower()
-        for x in re.split(r"(\d+)", path.name)
-    ]
 
+def is_numericish_token(tok):
+    if tok.isdigit():
+        return True
+    low = tok.lower()
+    return low in DIGIT_WORDS or low in REPEAT_WORDS or low in NUMBER_WORDS or low in MAGNITUDE_WORDS
 
-def get_final_output_paths(audio_path: Path) -> Tuple[Path, Path, Path]:
-    stem = audio_path.stem
-    latency_out = OUT_DIR / f"{stem}_latencies.json"
-    transcript_out = OUT_DIR / f"{stem}_transcript.txt"
-    error_out = OUT_DIR / f"{stem}_error.json"
-    return latency_out, transcript_out, error_out
 
+def has_numeric_context(tokens, start, end):
+    left_window = tokens[max(0, start - 4):start]
+    right_window = tokens[end:min(len(tokens), end + 4)]
+    window = left_window + right_window
 
-def is_final_result_complete(audio_path: Path) -> bool:
-    latency_out, transcript_out, _ = get_final_output_paths(audio_path)
-    return latency_out.exists() and transcript_out.exists()
+    for tok in window:
+        low = tok.lower()
+        if tok.isdigit():
+            return True
+        if low in NUMERIC_CUE_WORDS:
+            return True
+        if low in REPEAT_WORDS:
+            return True
 
+    if any(is_numericish_token(tok) for tok in left_window):
+        return True
+    if any(is_numericish_token(tok) for tok in right_window):
+        return True
 
-def get_remaining_audio_files(audio_files: List[Path]) -> List[Path]:
-    """
-    Remaining means:
-    - audio exists in benchmark_workspace/audios/
-    - but final transcript or final latencies file is missing
-    """
+    return False
 
-    remaining = []
 
-    for audio_path in audio_files:
-        stem = audio_path.stem
-        latency_out, transcript_out, _ = get_final_output_paths(audio_path)
+def should_convert_number_phrase(tokens, start, end):
+    phrase = [t.lower() for t in tokens[start:end] if is_word_token(t)]
+    if not phrase:
+        return False
 
-        if transcript_out.exists() and latency_out.exists():
-            print(f"[done] {stem} already has transcript + latencies", flush=True)
-            continue
+    if any(t in REPEAT_WORDS for t in phrase):
+        return True
 
-        missing = []
-        if not transcript_out.exists():
-            missing.append("transcript")
-        if not latency_out.exists():
-            missing.append("latencies")
+    if end < len(tokens):
+        nxt = tokens[end].lower()
+        if nxt in NON_NUMERIC_FOLLOW_WORDS and not has_numeric_context(tokens, start, end):
+            return False
 
-        print(f"[remaining] {stem} missing: {', '.join(missing)}", flush=True)
-        remaining.append(audio_path)
+    if has_numeric_context(tokens, start, end):
+        return True
 
-    return remaining
+    if len(phrase) >= 2:
+        return True
 
+    return False
 
-def get_error_audio_stems() -> set:
-    """
-    Returns stems for files that have error JSONs.
 
-    Example:
-      maria31_error.json -> maria31
-    """
-
-    error_files = sorted(OUT_DIR.glob("maria*_error.json"), key=natural_key)
-    stems = set()
-
-    for error_file in error_files:
-        stems.add(error_file.name.replace("_error.json", ""))
-
-    return stems
-
-
-# ---------------------------------------------------------------------
-# Audio helpers
-# ---------------------------------------------------------------------
-def read_wav_pcm16(wav_path: Path) -> Tuple[bytes, float]:
-    with wave.open(str(wav_path), "rb") as wf:
-        n_channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        file_sr = wf.getframerate()
-        n_frames = wf.getnframes()
-        raw_audio = wf.readframes(n_frames)
-
-    if sample_width != 2:
-        raise ValueError(f"{wav_path} is not 16-bit PCM WAV")
-
-    audio_i16 = np.frombuffer(raw_audio, dtype=np.int16)
-
-    if n_channels == 2:
-        audio_i16 = audio_i16.reshape(-1, 2).mean(axis=1).astype(np.int16)
-
-    if file_sr != SAMPLE_RATE:
-        raise ValueError(f"{wav_path} sample rate is {file_sr}, expected {SAMPLE_RATE}")
-
-    audio_duration_sec = len(audio_i16) / SAMPLE_RATE
-    return audio_i16.tobytes(), audio_duration_sec
-
-
-def get_wav_duration_sec(wav_path: Path) -> float:
-    with wave.open(str(wav_path), "rb") as wf:
-        return wf.getnframes() / float(wf.getframerate())
-
-
-def convert_mp3_to_full_wav(
-    mp3_path: Path,
-    force_wav: bool = False,
-) -> Path:
-    """
-    Converts original MP3 to one full 16kHz mono PCM16 WAV file.
-
-    Example:
-      maria31.mp3 -> benchmark_workspace/wav_16k/maria31.wav
-
-    A completion marker is written so incomplete WAVs are not reused.
-    """
-
-    WAV_DIR.mkdir(parents=True, exist_ok=True)
-
-    wav_path = WAV_DIR / f"{mp3_path.stem}.wav"
-    done_marker = WAV_DIR / f"{mp3_path.stem}_wav_complete.json"
-
-    if wav_path.exists() and done_marker.exists() and not force_wav:
-        print(f"[info] Using existing completed full WAV: {wav_path}", flush=True)
-        return wav_path
-
-    if wav_path.exists():
-        print(f"[warn] Removing incomplete/old WAV: {wav_path}", flush=True)
-        wav_path.unlink()
-
-    if done_marker.exists():
-        done_marker.unlink()
-
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-stats",
-        "-i",
-        str(mp3_path),
-        "-vn",
-        "-map",
-        "0:a:0",
-        "-ac",
-        "1",
-        "-ar",
-        str(SAMPLE_RATE),
-        "-sample_fmt",
-        "s16",
-        str(wav_path),
-    ]
-
-    run_cmd(cmd)
-
-    if not wav_path.exists() or wav_path.stat().st_size == 0:
-        raise RuntimeError(f"Full WAV conversion failed for {mp3_path}")
-
-    duration_sec = get_wav_duration_sec(wav_path)
-
-    done_marker.write_text(
-        json.dumps(
-            {
-                "source_audio": str(mp3_path),
-                "wav_file": str(wav_path),
-                "sample_rate": SAMPLE_RATE,
-                "duration_sec": duration_sec,
-                "created_at": datetime.now().isoformat(),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    print(
-        f"[info] Full WAV complete: {wav_path} duration={duration_sec:.2f}s",
-        flush=True,
-    )
-
-    return wav_path
-
-
-def split_wav_to_segments(
-    wav_path: Path,
-    segment_seconds: int,
-    force_split: bool = False,
-) -> List[Path]:
-    """
-    Splits a full WAV into fixed-size WAV segments.
-
-    Example:
-      maria31.wav
-        -> maria31_part_0000.wav
-        -> maria31_part_0001.wav
-        -> ...
-
-    A completion marker is written so incomplete segment folders are not reused.
-    """
-
-    per_audio_segment_dir = SEGMENT_DIR / wav_path.stem
-    per_audio_segment_dir.mkdir(parents=True, exist_ok=True)
-
-    done_marker = per_audio_segment_dir / "_split_complete.json"
-    pattern = per_audio_segment_dir / f"{wav_path.stem}_part_%04d.wav"
-
-    existing_segments = sorted(
-        per_audio_segment_dir.glob(f"{wav_path.stem}_part_*.wav"),
-        key=natural_key,
-    )
-
-    if existing_segments and done_marker.exists() and not force_split:
-        print(
-            f"[info] Using existing completed segments for {wav_path.stem}: {len(existing_segments)}",
-            flush=True,
-        )
-        return existing_segments
-
-    if existing_segments and not done_marker.exists():
-        print(
-            f"[warn] Incomplete segments found for {wav_path.stem}. Deleting and recreating.",
-            flush=True,
-        )
-
-    for old_file in existing_segments:
-        try:
-            old_file.unlink()
-        except FileNotFoundError:
-            pass
-
-    if done_marker.exists():
-        done_marker.unlink()
-
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-stats",
-        "-i",
-        str(wav_path),
-        "-f",
-        "segment",
-        "-segment_time",
-        str(segment_seconds),
-        "-reset_timestamps",
-        "1",
-        "-c",
-        "copy",
-        str(pattern),
-    ]
-
-    run_cmd(cmd)
-
-    segment_paths = sorted(
-        per_audio_segment_dir.glob(f"{wav_path.stem}_part_*.wav"),
-        key=natural_key,
-    )
-
-    if not segment_paths:
-        raise RuntimeError(f"No segments created for {wav_path}")
-
-    total_duration_sec = get_wav_duration_sec(wav_path)
-    segment_durations = []
-
-    for segment_path in segment_paths:
-        try:
-            segment_durations.append(get_wav_duration_sec(segment_path))
-        except Exception:
-            segment_durations.append(None)
-
-    done_marker.write_text(
-        json.dumps(
-            {
-                "wav_file": str(wav_path),
-                "segment_seconds": segment_seconds,
-                "segment_count": len(segment_paths),
-                "total_duration_sec": total_duration_sec,
-                "segment_durations_sec": segment_durations,
-                "created_at": datetime.now().isoformat(),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    print(
-        f"[info] Segmenting complete for {wav_path.name}: {len(segment_paths)} segments",
-        flush=True,
-    )
-
-    return segment_paths
-
-
-# ---------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------
-def normalize_for_metrics(text: str) -> str:
+def normalize_numeric_phrases_context_aware(text):
     if not text:
-        return ""
+        return text
 
-    text = text.lower()
-    text = text.replace("_", " ")
-    text = re.sub(r"<[a-z]{2}-[a-z]{2}>", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"[^\w\sáéíóúüñàèìòùç]", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
+    tokens = tokenize_text(text)
+    result = []
+    i = 0
 
+    while i < len(tokens):
+        tok = tokens[i]
+        low = tok.lower()
+
+        if low in REPEAT_WORDS and i + 1 < len(tokens):
+            if should_convert_number_phrase(tokens, i, min(i + 2, len(tokens))):
+                nxt = tokens[i + 1].lower()
+                repeat_count = REPEAT_WORDS[low]
+
+                if nxt in DIGIT_WORDS:
+                    result.append(DIGIT_WORDS[nxt] * repeat_count)
+                    i += 2
+                    continue
+
+                if tokens[i + 1].isdigit() and len(tokens[i + 1]) == 1:
+                    result.append(tokens[i + 1] * repeat_count)
+                    i += 2
+                    continue
+
+        if tok.isdigit() and len(tok) == 1:
+            digit_seq = [tok]
+            j = i + 1
+
+            while j < len(tokens):
+                cur = tokens[j].lower()
+
+                if tokens[j].isdigit() and len(tokens[j]) == 1:
+                    digit_seq.append(tokens[j])
+                    j += 1
+                    continue
+
+                if cur in DIGIT_WORDS:
+                    digit_seq.append(DIGIT_WORDS[cur])
+                    j += 1
+                    continue
+
+                if cur in REPEAT_WORDS and j + 1 < len(tokens):
+                    nxt = tokens[j + 1].lower()
+                    repeat_count = REPEAT_WORDS[cur]
+
+                    if nxt in DIGIT_WORDS:
+                        digit_seq.append(DIGIT_WORDS[nxt] * repeat_count)
+                        j += 2
+                        continue
+
+                    if tokens[j + 1].isdigit() and len(tokens[j + 1]) == 1:
+                        digit_seq.append(tokens[j + 1] * repeat_count)
+                        j += 2
+                        continue
+
+                break
+
+            if len(digit_seq) > 1:
+                result.append("".join(digit_seq))
+                i = j
+                continue
+
+        if low in NUMBER_WORDS or low in MAGNITUDE_WORDS or low == "and":
+            j = i
+            phrase_tokens = []
+
+            while j < len(tokens):
+                t = tokens[j].lower()
+                if t in NUMBER_WORDS or t in MAGNITUDE_WORDS or t == "and":
+                    phrase_tokens.append(t)
+                    j += 1
+                else:
+                    break
+
+            if should_convert_number_phrase(tokens, i, j):
+                value = spoken_number_to_int(phrase_tokens)
+                if value is not None:
+                    result.append(str(value))
+                    i = j
+                    continue
+
+        result.append(tok)
+        i += 1
+
+    text = " ".join(result)
+    text = re.sub(r"\s+([,.;:?!])", r"\1", text)
+    text = re.sub(r"\(\s+", "(", text)
+    text = re.sub(r"\s+\)", ")", text)
+    text = re.sub(r"\s*-\s*", " - ", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
     return text
 
+# =====================
+# AUDIO HELPERS
+# =====================
 
-def levenshtein_distance(a: List[str], b: List[str]) -> int:
-    if len(a) < len(b):
-        a, b = b, a
+def get_wav_info(audio_path):
+    with wave.open(audio_path, 'rb') as wf:
+        sample_rate = wf.getframerate()
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        frames = wf.getnframes()
+        duration = frames / sample_rate
 
-    previous = list(range(len(b) + 1))
-
-    for i, ca in enumerate(a, start=1):
-        current = [i]
-
-        for j, cb in enumerate(b, start=1):
-            insert_cost = current[j - 1] + 1
-            delete_cost = previous[j] + 1
-            replace_cost = previous[j - 1] + (ca != cb)
-
-            current.append(min(insert_cost, delete_cost, replace_cost))
-
-        previous = current
-
-    return previous[-1]
+        return {
+            'sample_rate': sample_rate,
+            'channels': channels,
+            'sample_width': sample_width,
+            'frames': frames,
+            'duration': duration
+        }
 
 
-def calculate_wer_cer_ser(reference_text: str, hypothesis_text: str) -> Dict:
-    ref_norm = normalize_for_metrics(reference_text)
-    hyp_norm = normalize_for_metrics(hypothesis_text)
+def get_audio_info(audio_path):
+    file_ext = Path(audio_path).suffix.lower()
 
-    ref_words = ref_norm.split()
-    hyp_words = hyp_norm.split()
-
-    word_edits = levenshtein_distance(ref_words, hyp_words)
-    wer = word_edits / max(1, len(ref_words))
-
-    ref_chars = list(ref_norm.replace(" ", ""))
-    hyp_chars = list(hyp_norm.replace(" ", ""))
-
-    char_edits = levenshtein_distance(ref_chars, hyp_chars)
-    cer = char_edits / max(1, len(ref_chars))
-
-    ref_lines = [x.strip() for x in reference_text.splitlines() if x.strip()]
-    hyp_lines = [x.strip() for x in hypothesis_text.splitlines() if x.strip()]
-
-    # If reference is one paragraph, SER is not meaningful.
-    if len(ref_lines) <= 1:
-        sentence_errors = None
-        sentence_count = len(ref_lines)
-        ser = None
+    if file_ext == '.wav':
+        return get_wav_info(audio_path)
     else:
-        sentence_count = len(ref_lines)
-        sentence_errors = 0
+        return {
+            'format': file_ext[1:],
+            'duration': None
+        }
 
-        for i, ref_line in enumerate(ref_lines):
-            hyp_line = hyp_lines[i] if i < len(hyp_lines) else ""
+# =====================
+# CORE WEBSOCKET LOGIC
+# =====================
 
-            r = normalize_for_metrics(ref_line).split()
-            h = normalize_for_metrics(hyp_line).split()
+async def send_wav_realtime(ws, audio_path, audio_info, first_chunk_sent_ref):
+    """
+    Sends WAV audio in 'real-time' paced chunks.
+    first_chunk_sent_ref is a one-element list used to store the timestamp of the first chunk.
+    """
+    try:
+        with open(audio_path, 'rb') as audio_file:
+            # Skip WAV header
+            audio_file.seek(44)
+            bytes_per_sample = audio_info['sample_width']
+            channels = audio_info['channels']
+            sample_rate = audio_info['sample_rate']
+            bytes_per_second = sample_rate * channels * bytes_per_sample
 
-            if levenshtein_distance(r, h) > 0:
-                sentence_errors += 1
+            target_chunk_ms = 100
+            chunk_size = int(bytes_per_second * (target_chunk_ms / 1000.0))
+            chunk_size = max(chunk_size, 4096)
 
-        ser = sentence_errors / max(1, sentence_count)
+            while True:
+                chunk = audio_file.read(chunk_size)
+                if not chunk:
+                    break
 
-    return {
-        "wer": wer,
-        "wer_percent": wer * 100,
-        "cer": cer,
-        "cer_percent": cer * 100,
-        "ser": ser,
-        "ser_percent": ser * 100 if ser is not None else None,
-        "word_edits": word_edits,
-        "reference_words": len(ref_words),
-        "hypothesis_words": len(hyp_words),
-        "char_edits": char_edits,
-        "reference_chars": len(ref_chars),
-        "hypothesis_chars": len(hyp_chars),
-        "sentence_errors": sentence_errors,
-        "sentence_count": sentence_count,
+                await ws.send(chunk)
+
+                if first_chunk_sent_ref[0] is None:
+                    first_chunk_sent_ref[0] = time.time()
+
+                chunk_duration = len(chunk) / bytes_per_second
+                await asyncio.sleep(chunk_duration)
+
+        # After sending all audio, tell Deepgram we're done
+        await ws.send(json.dumps({"type": "CloseStream"}))
+
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(f"  Sender: connection closed while sending: {e}")
+    except Exception as e:
+        print(f"  Sender error: {e}")
+
+
+async def transcribe_audio_websocket(api_key, audio_path):
+    audio_info = get_audio_info(audio_path)
+    file_ext = Path(audio_path).suffix.lower()
+
+    if file_ext != '.wav':
+        print("  ✗ This realtime-paced version currently expects WAV input.")
+        return None
+
+    print(f"  Audio: {audio_info['sample_rate']}Hz, {audio_info['channels']}ch, {audio_info['duration']:.2f}s")
+
+    # Start simple & robust; you can re-enable tweaks later
+    params = (
+        "model=nova-3&"
+        "language=multi&"
+        "punctuate=true&"
+        "numerals=true&"
+        "interim_results=true&"
+        "endpointing=300&"
+        "utterance_end_ms=1000&"
+        "no_delay=true&"
+        "encoding=linear16&"
+        f"sample_rate={audio_info['sample_rate']}&"
+        "channels=1"
+    )
+
+    ws_url = f"wss://api.deepgram.com/v1/listen?{params}"
+    headers = {
+        "Authorization": f"Token {api_key}"
     }
 
+    transcripts = []
+    latencies = []
+    finalized_segments = []
+    utterance_buffer = []
 
-# ---------------------------------------------------------------------
-# Single-segment WebSocket transcription
-# ---------------------------------------------------------------------
-async def benchmark_one_segment(
-    wav_path: Path,
-    original_audio_path: Path,
-    language: str,
-    url: str,
-    realtime: bool,
-    receive_timeout_sec: float,
-    fast_sleep_sec: float,
-    segment_idx: int,
-    segment_count: int,
-) -> Dict:
-    raw_bytes, audio_duration_sec = read_wav_pcm16(wav_path)
+    start_time = time.time()
+    audio_duration = audio_info.get('duration')
 
-    chunks = [
-        raw_bytes[i : i + CHUNK_BYTES]
-        for i in range(0, len(raw_bytes), CHUNK_BYTES)
-    ]
+    first_byte_time = None
+    first_response_time = None
+    first_final_time = None
+    connection_time = None
+    send_duration = None
+    first_chunk_sent_ref = [None]
 
-    response_events = []
-    final_texts = []
+    try:
+        print("  Connecting to Deepgram WebSocket (Nova-3 realtime)...")
+        async with websockets.connect(ws_url, additional_headers=headers) as ws:
+            connection_time = time.time() - start_time
+            print(f"  Connected in {connection_time:.3f}s")
+            print("  Sending audio via paced realtime chunks...")
 
-    partial_count = 0
-    final_count = 0
+            send_start = time.time()
 
-    connection_start = time.time()
+            async def receiver():
+                nonlocal first_byte_time, first_response_time, first_final_time, audio_duration
+                response_count = 0
+                try:
+                    async for message in ws:
+                        receive_time = time.time()
+                        response = json.loads(message)
+                        msg_type = response.get("type")
 
-    async with websockets.connect(
-        url,
-        ping_interval=None,
-        ping_timeout=None,
-        max_size=None,
-        close_timeout=30,
-    ) as ws:
-        connected_at = time.time()
-        connection_time_sec = connected_at - connection_start
+                        if first_byte_time is None:
+                            first_byte_time = receive_time - start_time
 
-        await ws.send(
-            json.dumps(
-                {
-                    "backend": "nemotron",
-                    "sample_rate": SAMPLE_RATE,
-                    "language": language,
-                }
-            )
-        )
+                        if msg_type == "Results":
+                            response_count += 1
 
-        first_chunk_sent_at = None
-        send_start = time.time()
-        send_end = None
+                            if 'channel' in response:
+                                alternatives = response['channel'].get('alternatives', [])
+                                if alternatives:
+                                    raw_transcript = alternatives[0].get('transcript', '')
+                                    transcript = normalize_numeric_phrases_context_aware(raw_transcript)
+                                    confidence = alternatives[0].get('confidence', 0)
+                                    is_final = response.get('is_final', False)
+                                    speech_final = response.get('speech_final', False)
 
-        done_event = asyncio.Event()
+                                    latency_from_start = receive_time - start_time
+                                    latency_from_send_start = receive_time - send_start
+                                    if first_chunk_sent_ref[0]:
+                                        latency_from_first_chunk = receive_time - first_chunk_sent_ref[0]
+                                    else:
+                                        latency_from_first_chunk = 0
 
-        async def receiver():
-            nonlocal partial_count
-            nonlocal final_count
-            nonlocal send_end
+                                    if first_response_time is None and transcript:
+                                        first_response_time = latency_from_start
+                                    if first_final_time is None and is_final and transcript:
+                                        first_final_time = latency_from_start
 
-            response_num = 0
+                                    result_info = {
+                                        'response_num': response_count,
+                                        'timestamp': latency_from_start,
+                                        'latency_from_start': latency_from_start,
+                                        'latency_from_send_start': latency_from_send_start,
+                                        'latency_from_first_chunk': latency_from_first_chunk,
+                                        'is_final': is_final,
+                                        'speech_final': speech_final,
+                                        'raw_transcript': raw_transcript,
+                                        'transcript': transcript,
+                                        'confidence': confidence
+                                    }
 
+                                    if transcript:
+                                        transcripts.append(result_info)
+                                        latencies.append({
+                                            'response_num': response_count,
+                                            'latency_from_start_ms': latency_from_start * 1000,
+                                            'latency_from_send_start_ms': latency_from_send_start * 1000,
+                                            'latency_from_first_chunk_ms': latency_from_first_chunk * 1000,
+                                            'is_final': is_final,
+                                            'speech_final': speech_final,
+                                            'words': len(transcript.split()),
+                                            'char_count': len(transcript)
+                                        })
+
+                                    if is_final and transcript:
+                                        utterance_buffer.append(transcript)
+
+                                    if speech_final and utterance_buffer:
+                                        finalized_segments.append(" ".join(utterance_buffer).strip())
+                                        utterance_buffer.clear()
+
+                                    status = "FINAL" if is_final else "INTERIM"
+                                    sf = " [speech_final]" if speech_final else ""
+                                    preview = transcript[:80] + "..." if len(transcript) > 80 else transcript
+                                    if preview:
+                                        print(f"    [{status}]{sf} Resp {response_count}: {preview}")
+
+                        elif msg_type == "UtteranceEnd":
+                            if utterance_buffer:
+                                finalized_segments.append(" ".join(utterance_buffer).strip())
+                                utterance_buffer.clear()
+                            print("    [EVENT] UtteranceEnd")
+
+                        elif msg_type == "Metadata":
+                            print("  Metadata received")
+                            if audio_duration is None and 'duration' in response:
+                                audio_duration = response['duration']
+
+                        elif msg_type == "SpeechStarted":
+                            print("  Speech started")
+
+                except websockets.exceptions.ConnectionClosedError as e:
+                    print(f"  Receiver: connection closed by server: {e}")
+                except Exception as e:
+                    print(f"  Receiver error: {e}")
+
+            receiver_task = asyncio.create_task(receiver())
+            await send_wav_realtime(ws, audio_path, audio_info, first_chunk_sent_ref)
+            send_end = time.time()
+            send_duration = send_end - send_start
+
+            # Wait a bit for remaining messages, then cancel receiver if still running
             try:
-                async for raw in ws:
-                    if isinstance(raw, bytes):
-                        continue
+                await asyncio.wait_for(receiver_task, timeout=5)
+            except asyncio.TimeoutError:
+                receiver_task.cancel()
 
-                    try:
-                        msg = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
+    except Exception as e:
+        print(f"  ✗ WebSocket Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
-                    now = time.time()
-                    ev_type = msg.get("type", "")
-                    text = clean_text(msg.get("text", ""))
-                    t_start = msg.get("t_start")
-                    server_session_id = msg.get("session_id")
-                    server_timestamp_utc = msg.get("timestamp_utc")
+    if utterance_buffer:
+        finalized_segments.append(" ".join(utterance_buffer).strip())
+        utterance_buffer.clear()
 
-                    if ev_type == "done":
-                        done_event.set()
-                        break
-
-                    if ev_type == "error":
-                        response_num += 1
-
-                        response_events.append(
-                            {
-                                "response_num": response_num,
-                                "segment_idx": segment_idx,
-                                "segment_count": segment_count,
-                                "segment_file": str(wav_path),
-                                "type": "error",
-                                "text": text,
-                                "timestamp": datetime.now().isoformat(),
-                                "server_session_id": server_session_id,
-                                "server_timestamp_utc": server_timestamp_utc,
-                                "latency_from_start_ms": (now - connection_start) * 1000,
-                                "latency_from_send_start_ms": (now - send_start) * 1000,
-                                "latency_from_first_chunk_ms": (
-                                    (now - first_chunk_sent_at) * 1000
-                                    if first_chunk_sent_at
-                                    else None
-                                ),
-                                "latency_from_send_end_ms": (
-                                    (now - send_end) * 1000
-                                    if send_end
-                                    else None
-                                ),
-                                "is_final": False,
-                                "words": 0,
-                                "char_count": 0,
-                                "server_t_start": t_start,
-                            }
-                        )
-                        continue
-
-                    if ev_type not in {"partial", "final"}:
-                        continue
-
-                    response_num += 1
-
-                    if ev_type == "partial":
-                        partial_count += 1
-
-                    if ev_type == "final":
-                        final_count += 1
-                        if text:
-                            final_texts.append(text)
-
-                    response_events.append(
-                        {
-                            "response_num": response_num,
-                            "segment_idx": segment_idx,
-                            "segment_count": segment_count,
-                            "segment_file": str(wav_path),
-                            "type": ev_type,
-                            "latency_from_start_ms": (now - connection_start) * 1000,
-                            "latency_from_send_start_ms": (now - send_start) * 1000,
-                            "latency_from_first_chunk_ms": (
-                                (now - first_chunk_sent_at) * 1000
-                                if first_chunk_sent_at
-                                else None
-                            ),
-                            "latency_from_send_end_ms": (
-                                (now - send_end) * 1000
-                                if send_end
-                                else None
-                            ),
-                            "is_final": ev_type == "final",
-                            "words": len(text.split()),
-                            "char_count": len(text),
-                            "server_t_start": t_start,
-                            "server_session_id": server_session_id,
-                            "server_timestamp_utc": server_timestamp_utc,
-                            "text": text,
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                    )
-
-            except Exception as e:
-                response_events.append(
-                    {
-                        "response_num": len(response_events) + 1,
-                        "segment_idx": segment_idx,
-                        "segment_count": segment_count,
-                        "segment_file": str(wav_path),
-                        "type": "client_receive_error",
-                        "text": str(e),
-                        "timestamp": datetime.now().isoformat(),
-                        "is_final": False,
-                        "words": 0,
-                        "char_count": 0,
-                    }
-                )
-
-                done_event.set()
-
-        recv_task = asyncio.create_task(receiver())
-
-        print(
-            f"Sending segment {segment_idx}/{segment_count} "
-            f"duration={audio_duration_sec:.2f}s chunks={len(chunks)} realtime={realtime}",
-            flush=True,
-        )
-
-        for i, chunk in enumerate(chunks):
-            if first_chunk_sent_at is None:
-                first_chunk_sent_at = time.time()
-
-            await ws.send(chunk)
-
-            if realtime:
-                expected_elapsed = (i + 1) * CHUNK_MS / 1000.0
-                actual_elapsed = time.time() - send_start
-                sleep_for = expected_elapsed - actual_elapsed
-
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-            else:
-                await asyncio.sleep(fast_sleep_sec)
-
-        send_end = time.time()
-        send_duration_sec = send_end - send_start
-
-        await ws.send(json.dumps({"type": "eof"}))
-
-        dynamic_timeout = max(receive_timeout_sec, audio_duration_sec + 600)
-
-        try:
-            await asyncio.wait_for(done_event.wait(), timeout=dynamic_timeout)
-        except asyncio.TimeoutError:
-            print(
-                f"[warn] Timeout waiting for done after EOF: "
-                f"{wav_path.name} timeout={dynamic_timeout}s",
-                flush=True,
-            )
-
-        recv_task.cancel()
-
-        try:
-            await recv_task
-        except asyncio.CancelledError:
-            pass
-
-    total_processing_time_sec = time.time() - connection_start
-
-    transcript = " ".join(t.strip() for t in final_texts if t.strip())
-    transcript = re.sub(r"\s+", " ", transcript).strip()
-
-    first_response = response_events[0] if response_events else None
-    first_final = next((x for x in response_events if x.get("is_final")), None)
-
-    timing_metrics = {
-        "connection_time_sec": connection_time_sec,
-        "send_duration_sec": send_duration_sec,
-        "first_byte_latency_sec": (
-            first_response["latency_from_start_ms"] / 1000
-            if first_response
-            else None
-        ),
-        "first_response_latency_sec": (
-            first_response["latency_from_start_ms"] / 1000
-            if first_response
-            else None
-        ),
-        "first_final_latency_sec": (
-            first_final["latency_from_start_ms"] / 1000
-            if first_final
-            else None
-        ),
-        "time_to_first_chunk_sec": (
-            first_chunk_sent_at - connection_start if first_chunk_sent_at else None
-        ),
-    }
-
-    result = {
-        "audio_file": str(original_audio_path),
-        "segment_file": str(wav_path),
-        "segment_idx": segment_idx,
-        "segment_count": segment_count,
-        "audio_duration_sec": audio_duration_sec,
-        "total_processing_time_sec": total_processing_time_sec,
-        "rtf": (
-            total_processing_time_sec / audio_duration_sec
-            if audio_duration_sec > 0
-            else None
-        ),
-        "timestamp": datetime.now().isoformat(),
-        "model": MODEL_NAME,
-        "language": language,
-        "server_url": url,
-        "realtime": realtime,
-        "timing_metrics": timing_metrics,
-        "summary": {
-            "partial_count": partial_count,
-            "final_count": final_count,
-            "total_response_count": len(response_events),
-            "transcript_words": len(transcript.split()),
-            "transcript_chars": len(transcript),
-        },
-        "latencies": response_events,
-    }
+    total_time = time.time() - start_time
+    print(f"  Total processing time: {total_time:.3f}s")
 
     return {
-        "result": result,
-        "transcript": transcript,
+        'transcripts': transcripts,
+        'latencies': latencies,
+        'finalized_segments': finalized_segments,
+        'total_time': total_time,
+        'audio_duration': audio_duration if audio_duration else 0,
+        'timing_metrics': {
+            'connection_time': connection_time,
+            'send_duration': send_duration,
+            'first_byte_time': first_byte_time,
+            'first_response_time': first_response_time,
+            'first_final_time': first_final_time,
+            'time_to_first_chunk': (first_chunk_sent_ref[0] - start_time) if first_chunk_sent_ref[0] else None
+        }
     }
 
+# =====================
+# SAVE RESULTS
+# =====================
 
-# ---------------------------------------------------------------------
-# Full original audio benchmark using segments
-# ---------------------------------------------------------------------
-async def benchmark_segmented_audio(
-    segment_paths: List[Path],
-    original_audio_path: Path,
-    reference_path: Optional[Path],
-    language: str,
-    url: str,
-    realtime: bool,
-    receive_timeout_sec: float,
-    fast_sleep_sec: float,
-) -> Dict:
-    all_latencies = []
-    all_transcript_parts = []
-    segment_summaries = []
+def save_results(audio_path, result, output_dir):
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        audio_name = Path(audio_path).stem
 
-    total_audio_duration_sec = 0.0
-    total_processing_time_sec = 0.0
+        transcript_file = os.path.join(output_dir, f"{audio_name}_transcript.txt")
 
-    segment_count = len(segment_paths)
-
-    for segment_idx, wav_path in enumerate(segment_paths, start=1):
-        print(
-            f"\nTranscribing segment {segment_idx}/{segment_count}: {wav_path.name}",
-            flush=True,
-        )
-
-        segment_start = time.time()
-
-        segment_benchmark = await benchmark_one_segment(
-            wav_path=wav_path,
-            original_audio_path=original_audio_path,
-            language=language,
-            url=url,
-            realtime=realtime,
-            receive_timeout_sec=receive_timeout_sec,
-            fast_sleep_sec=fast_sleep_sec,
-            segment_idx=segment_idx,
-            segment_count=segment_count,
-        )
-
-        segment_processing_time_sec = time.time() - segment_start
-
-        segment_result = segment_benchmark["result"]
-        segment_transcript = segment_benchmark["transcript"].strip()
-
-        if segment_transcript:
-            all_transcript_parts.append(segment_transcript)
-
-        segment_latencies = segment_result["latencies"]
-        all_latencies.extend(segment_latencies)
-
-        total_audio_duration_sec += segment_result["audio_duration_sec"]
-        total_processing_time_sec += segment_processing_time_sec
-
-        segment_summaries.append(
-            {
-                "segment_idx": segment_idx,
-                "segment_file": str(wav_path),
-                "audio_duration_sec": segment_result["audio_duration_sec"],
-                "processing_time_sec": segment_processing_time_sec,
-                "rtf": (
-                    segment_processing_time_sec / segment_result["audio_duration_sec"]
-                    if segment_result["audio_duration_sec"] > 0
-                    else None
-                ),
-                "final_count": segment_result["summary"]["final_count"],
-                "partial_count": segment_result["summary"]["partial_count"],
-                "total_response_count": segment_result["summary"]["total_response_count"],
-                "transcript_words": len(segment_transcript.split()),
-                "transcript_chars": len(segment_transcript),
-            }
-        )
-
-    transcript = " ".join(x.strip() for x in all_transcript_parts if x.strip())
-    transcript = re.sub(r"\s+", " ", transcript).strip()
-
-    reference_text = ""
-    accuracy_metrics = None
-
-    if reference_path and reference_path.exists():
-        reference_text = reference_path.read_text(
-            encoding="utf-8",
-            errors="ignore",
-        )
-
-        accuracy_metrics = calculate_wer_cer_ser(
-            reference_text=reference_text,
-            hypothesis_text=transcript,
-        )
-
-    first_response = all_latencies[0] if all_latencies else None
-    first_final = next((x for x in all_latencies if x.get("is_final")), None)
-
-    result = {
-        "audio_file": str(original_audio_path),
-        "reference_file": str(reference_path) if reference_path else None,
-        "audio_duration_sec": total_audio_duration_sec,
-        "total_processing_time_sec": total_processing_time_sec,
-        "rtf": (
-            total_processing_time_sec / total_audio_duration_sec
-            if total_audio_duration_sec > 0
-            else None
-        ),
-        "timestamp": datetime.now().isoformat(),
-        "model": MODEL_NAME,
-        "language": language,
-        "server_url": url,
-        "realtime": realtime,
-        "segmented": True,
-        "segment_count": segment_count,
-        "timing_metrics": {
-            "first_byte_latency_sec": (
-                first_response["latency_from_start_ms"] / 1000
-                if first_response
-                else None
-            ),
-            "first_response_latency_sec": (
-                first_response["latency_from_start_ms"] / 1000
-                if first_response
-                else None
-            ),
-            "first_final_latency_sec": (
-                first_final["latency_from_start_ms"] / 1000
-                if first_final
-                else None
-            ),
-        },
-        "summary": {
-            "segment_count": segment_count,
-            "total_response_count": len(all_latencies),
-            "final_count": sum(1 for x in all_latencies if x.get("is_final")),
-            "partial_count": sum(1 for x in all_latencies if x.get("type") == "partial"),
-            "transcript_lines": 1 if transcript else 0,
-            "transcript_words": len(transcript.split()),
-            "transcript_chars": len(transcript),
-        },
-        "segment_summaries": segment_summaries,
-        "accuracy_metrics": accuracy_metrics,
-        "latencies": all_latencies,
-    }
-
-    return {
-        "result": result,
-        "transcript": transcript,
-        "reference_text": reference_text,
-    }
-
-
-# ---------------------------------------------------------------------
-# File matching
-# ---------------------------------------------------------------------
-def find_reference_for_audio(audio_path: Path) -> Optional[Path]:
-    candidates = [
-        REF_DIR / f"{audio_path.stem}_reference.txt",
-        REF_DIR / f"{audio_path.stem}_reference.text",
-    ]
-
-    for ref_path in candidates:
-        if ref_path.exists():
-            return ref_path
-
-    return None
-
-
-# ---------------------------------------------------------------------
-# Main benchmark runner
-# ---------------------------------------------------------------------
-async def run_benchmark(args):
-    ensure_dirs()
-
-    if args.download:
-        download_inputs()
-
-    audio_files = sorted(AUDIO_DIR.glob("maria*.mp3"), key=natural_key)
-
-    if args.only_file:
-        wanted = args.only_file.replace(".mp3", "").strip()
-        audio_files = [p for p in audio_files if p.stem == wanted]
-        if not audio_files:
-            raise RuntimeError(f"No audio found for --only-file {wanted}")
-        print(f"[info] Running only file: {wanted}", flush=True)
-
-    if args.only_errors:
-        error_stems = get_error_audio_stems()
-        if not error_stems:
-            print("[info] No maria*_error.json files found. Nothing to rerun.", flush=True)
-            return
-
-        print(f"[info] Re-running only failed files: {sorted(error_stems)}", flush=True)
-        audio_files = [audio_path for audio_path in audio_files if audio_path.stem in error_stems]
-
-    if args.remaining_only:
-        audio_files = get_remaining_audio_files(audio_files)
-        if not audio_files:
-            print("[info] No remaining files found. Everything is completed.", flush=True)
-            return
-
-    if args.limit:
-        audio_files = audio_files[: args.limit]
-
-    if not audio_files:
-        raise RuntimeError(f"No maria*.mp3 files found in {AUDIO_DIR}")
-
-    print(f"\nFound {len(audio_files)} maria audio files to run.", flush=True)
-
-    completed = 0
-    failed = 0
-    skipped = 0
-
-    for idx, audio_path in enumerate(audio_files, start=1):
-        print("\n" + "=" * 80, flush=True)
-        print(f"[{idx}/{len(audio_files)}] Benchmarking: {audio_path.name}", flush=True)
-        print("=" * 80, flush=True)
-
-        reference_path = find_reference_for_audio(audio_path)
-
-        if reference_path:
-            print(f"Reference: {reference_path.name}", flush=True)
+        if result.get('finalized_segments'):
+            full_transcript = " ".join(result['finalized_segments']).strip()
         else:
-            print(f"[warn] No reference found for {audio_path.name}", flush=True)
+            final_transcripts = [t['transcript'] for t in result['transcripts'] if t['is_final']]
+            full_transcript = ' '.join(final_transcripts).strip()
 
-        latency_out, transcript_out, error_out = get_final_output_paths(audio_path)
+        with open(transcript_file, 'w', encoding='utf-8') as f:
+            f.write(full_transcript)
 
-        if is_final_result_complete(audio_path) and not args.force and not args.remaining_only and not args.only_errors:
-            print(f"[skip] Existing output found for {audio_path.stem}, skipping.", flush=True)
-            skipped += 1
+        print(f"  💾 Transcript saved to: {transcript_file}")
+        print(f"     Words: {len(full_transcript.split())}")
 
-            if args.upload_each:
-                try:
-                    gcs_upload_files([latency_out, transcript_out], RESULT_GCS)
-                except Exception as upload_error:
-                    print(f"[warn] Could not upload skipped existing files: {upload_error}", flush=True)
-            continue
+        latency_file = os.path.join(output_dir, f"{audio_name}_latencies.json")
 
-        try:
-            full_wav_path = convert_mp3_to_full_wav(
-                mp3_path=audio_path,
-                force_wav=args.force_wav,
-            )
+        if result['latencies']:
+            avg_from_send_start = sum(l['latency_from_send_start_ms'] for l in result['latencies']) / len(result['latencies'])
+            min_from_send_start = min(l['latency_from_send_start_ms'] for l in result['latencies'])
+            max_from_send_start = max(l['latency_from_send_start_ms'] for l in result['latencies'])
 
-            segment_paths = split_wav_to_segments(
-                wav_path=full_wav_path,
-                segment_seconds=args.segment_seconds,
-                force_split=args.force_split,
-            )
+            avg_from_first_chunk = sum(l['latency_from_first_chunk_ms'] for l in result['latencies']) / len(result['latencies'])
+            min_from_first_chunk = min(l['latency_from_first_chunk_ms'] for l in result['latencies'])
+            max_from_first_chunk = max(l['latency_from_first_chunk_ms'] for l in result['latencies'])
+        else:
+            avg_from_send_start = min_from_send_start = max_from_send_start = 0
+            avg_from_first_chunk = min_from_first_chunk = max_from_first_chunk = 0
 
-            print(
-                f"Created/found {len(segment_paths)} segments for {audio_path.name}",
-                flush=True,
-            )
-
-            benchmark = await benchmark_segmented_audio(
-                segment_paths=segment_paths,
-                original_audio_path=audio_path,
-                reference_path=reference_path,
-                language=args.language,
-                url=args.url,
-                realtime=args.realtime,
-                receive_timeout_sec=args.receive_timeout,
-                fast_sleep_sec=args.fast_sleep,
-            )
-
-            latency_out.write_text(
-                json.dumps(
-                    benchmark["result"],
-                    indent=2,
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-
-            transcript_out.write_text(
-                benchmark["transcript"],
-                encoding="utf-8",
-            )
-
-            acc = benchmark["result"].get("accuracy_metrics")
-
-            if acc:
-                ser_str = (
-                    f"{acc['ser_percent']:.2f}%"
-                    if acc.get("ser_percent") is not None
-                    else "N/A"
-                )
-
-                print(
-                    f"WER={acc['wer_percent']:.2f}% "
-                    f"CER={acc['cer_percent']:.2f}% "
-                    f"SER={ser_str}",
-                    flush=True,
-                )
-
-            print(f"Saved: {latency_out}", flush=True)
-            print(f"Saved: {transcript_out}", flush=True)
-
-            if error_out.exists():
-                try:
-                    error_out.unlink()
-                    print(f"[info] Removed old error file: {error_out}", flush=True)
-                except Exception as remove_error:
-                    print(f"[warn] Could not remove old error file: {remove_error}", flush=True)
-
-            completed += 1
-
-            if args.upload_each:
-                print(f"Uploading result files for {audio_path.stem} to GCS...", flush=True)
-                gcs_upload_files([latency_out, transcript_out], RESULT_GCS)
-
-        except Exception as e:
-            failed += 1
-            print(f"[error] Failed benchmarking {audio_path.name}: {e}", flush=True)
-
-            error_payload = {
-                "audio_file": str(audio_path),
-                "reference_file": str(reference_path) if reference_path else None,
-                "timestamp": datetime.now().isoformat(),
-                "model": MODEL_NAME,
-                "language": args.language,
-                "server_url": args.url,
-                "segment_seconds": args.segment_seconds,
-                "error": repr(e),
-                "status": "failed",
+        latency_data = {
+            'audio_file': audio_path,
+            'audio_duration_sec': result['audio_duration'],
+            'total_processing_time_sec': result['total_time'],
+            'timestamp': datetime.now().isoformat(),
+            'model': 'nova-3',
+            'language': 'multi',
+            'finalized_segments': result.get('finalized_segments', []),
+            'timing_metrics': {
+                'connection_time_sec': result['timing_metrics']['connection_time'],
+                'send_duration_sec': result['timing_metrics']['send_duration'],
+                'first_byte_latency_sec': result['timing_metrics']['first_byte_time'],
+                'first_response_latency_sec': result['timing_metrics']['first_response_time'],
+                'first_final_latency_sec': result['timing_metrics']['first_final_time'],
+                'time_to_first_chunk_sec': result['timing_metrics']['time_to_first_chunk']
+            },
+            'latencies': result['latencies'],
+            'summary': {
+                'total_responses': len(result['latencies']),
+                'final_responses': sum(1 for l in result['latencies'] if l['is_final']),
+                'speech_final_responses': sum(1 for l in result['latencies'] if l.get('speech_final')),
+                'total_words': sum(l['words'] for l in result['latencies']),
+                'total_characters': sum(l['char_count'] for l in result['latencies']),
+                'avg_latency_from_send_start_ms': avg_from_send_start,
+                'min_latency_from_send_start_ms': min_from_send_start,
+                'max_latency_from_send_start_ms': max_from_send_start,
+                'avg_latency_from_first_chunk_ms': avg_from_first_chunk,
+                'min_latency_from_first_chunk_ms': min_from_first_chunk,
+                'max_latency_from_first_chunk_ms': max_from_first_chunk,
             }
+        }
 
-            error_out.write_text(
-                json.dumps(error_payload, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+        with open(latency_file, 'w', encoding='utf-8') as f:
+            json.dump(latency_data, f, indent=2, ensure_ascii=False)
 
-            print(f"Saved error file: {error_out}", flush=True)
+        print(f"  💾 Latencies saved to: {latency_file}")
+        if result['timing_metrics']['first_byte_time'] is not None:
+            print(f"     First byte: {result['timing_metrics']['first_byte_time']:.3f}s")
+        if result['timing_metrics']['first_response_time']:
+            print(f"     First response: {result['timing_metrics']['first_response_time']:.3f}s")
+        if result['timing_metrics']['first_final_time']:
+            print(f"     First final: {result['timing_metrics']['first_final_time']:.3f}s")
 
-            if args.upload_each:
-                try:
-                    gcs_upload_files([error_out], RESULT_GCS)
-                except Exception as upload_error:
-                    print(f"[warn] Could not upload error file: {upload_error}", flush=True)
+        return transcript_file, latency_file
 
+    except Exception as e:
+        print(f"  ✗ Error saving results: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+# =====================
+# MAIN
+# =====================
+
+async def main():
+    print("=" * 70)
+    print("Deepgram Nova-3 ASR Testing (WebSocket Streaming - Realtime)")
+    print("=" * 70)
+    print(f"API Key: {DEEPGRAM_API_KEY[:10]}...")
+    print(f"Output Directory: {OUTPUT_DIR}")
+    print(f"Audio Files: {len(AUDIO_FILES)} files found")
+    print(f"Processing Mode: Sequential realtime-paced streaming")
+    print()
+
+    skipped_count = 0
+    newly_processed_count = 0
+    failed_count = 0
+
+    for idx, audio_file in enumerate(AUDIO_FILES, 1):
+        print("-" * 70)
+        print(f"Processing [{idx}/{len(AUDIO_FILES)}]: {audio_file}")
+        print("-" * 70)
+
+        if not os.path.exists(audio_file):
+            print("ERROR: File not found")
+            failed_count += 1
             continue
 
-    if args.upload:
-        print("\nUploading all result files to GCS...", flush=True)
-        gcs_upload_dir(OUT_DIR, RESULT_GCS)
-        print(f"Uploaded to: {RESULT_GCS}/", flush=True)
+        audio_name = Path(audio_file).stem
+        transcript_file = os.path.join(OUTPUT_DIR, f"{audio_name}_transcript.txt")
+        latency_file = os.path.join(OUTPUT_DIR, f"{audio_name}_latencies.json")
 
-    print("\nBenchmark complete.", flush=True)
-    print(f"Completed: {completed}", flush=True)
-    print(f"Skipped:   {skipped}", flush=True)
-    print(f"Failed:    {failed}", flush=True)
-    print(f"Results:   {OUT_DIR}", flush=True)
-    print(f"GCS:       {RESULT_GCS}/", flush=True)
+        if os.path.exists(transcript_file) and os.path.exists(latency_file):
+            print("✓ SKIPPED - Already processed")
+            print(f"  Found: {transcript_file}")
+            print(f"  Found: {latency_file}")
+            skipped_count += 1
+            print()
+            continue
 
+        file_size = os.path.getsize(audio_file)
+        print(f"File size: {file_size:,} bytes ({file_size / 1024:.2f} KB)")
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Benchmark Nemotron 3.5 ASR on maria*.mp3 files from GCS"
-    )
+        result = await transcribe_audio_websocket(DEEPGRAM_API_KEY, audio_file)
 
-    parser.add_argument(
-        "--url",
-        default=DEFAULT_WS_URL,
-        help=f"Nemotron WebSocket URL. Default: {DEFAULT_WS_URL}",
-    )
+        if result and result['transcripts']:
+            print(f"\n✓ SUCCESS! Transcription Complete: {audio_file}")
+            save_results(audio_file, result, OUTPUT_DIR)
+            newly_processed_count += 1
+        else:
+            print(f"\n✗ Failed to get transcription: {audio_file}")
+            failed_count += 1
 
-    parser.add_argument(
-        "--language",
-        default="auto",
-        help="Language: auto, en-US, es-US. Default: auto",
-    )
+        print()
 
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Optional number of maria*.mp3 files to benchmark. Default: all selected files.",
-    )
-
-    parser.add_argument(
-        "--segment-seconds",
-        type=int,
-        default=300,
-        help="Split full WAV into N-second chunks. Default: 300 seconds.",
-    )
-
-    parser.add_argument(
-        "--realtime",
-        action="store_true",
-        help="Send chunks in real-time pacing. Recommended for complete long audio transcription.",
-    )
-
-    parser.add_argument(
-        "--receive-timeout",
-        type=float,
-        default=1200.0,
-        help="Minimum seconds to wait for done after EOF. Default: 1200.",
-    )
-
-    parser.add_argument(
-        "--fast-sleep",
-        type=float,
-        default=0.005,
-        help="Sleep between chunks in non-realtime mode. Default: 0.005 sec.",
-    )
-
-    parser.add_argument(
-        "--download",
-        action="store_true",
-        default=True,
-        help="Download audios/references from GCS. Default: true.",
-    )
-
-    parser.add_argument(
-        "--no-download",
-        dest="download",
-        action="store_false",
-        help="Skip GCS download and use local benchmark_workspace files.",
-    )
-
-    parser.add_argument(
-        "--upload",
-        action="store_true",
-        default=True,
-        help="Upload all result files to GCS at the end. Default: true.",
-    )
-
-    parser.add_argument(
-        "--no-upload",
-        dest="upload",
-        action="store_false",
-        help="Skip final bulk GCS upload.",
-    )
-
-    parser.add_argument(
-        "--upload-each",
-        action="store_true",
-        default=True,
-        help="Upload each audio result immediately after benchmarking. Default: true.",
-    )
-
-    parser.add_argument(
-        "--no-upload-each",
-        dest="upload_each",
-        action="store_false",
-        help="Do not upload each result immediately.",
-    )
-
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-run even if final output files already exist.",
-    )
-
-    parser.add_argument(
-        "--force-wav",
-        action="store_true",
-        help="Recreate full WAV even if WAV completion marker exists.",
-    )
-
-    parser.add_argument(
-        "--force-split",
-        action="store_true",
-        help="Recreate WAV segments even if split completion marker exists.",
-    )
-
-    parser.add_argument(
-        "--remaining-only",
-        action="store_true",
-        help="Run only audios that do not have final transcript + latencies result.",
-    )
-
-    parser.add_argument(
-        "--only-errors",
-        action="store_true",
-        help="Run only audios that have maria*_error.json in the result folder.",
-    )
-
-    parser.add_argument(
-        "--only-file",
-        type=str,
-        default=None,
-        help="Run only one audio stem, for example maria31 or maria31.mp3.",
-    )
-
-    args = parser.parse_args()
-
-    asyncio.run(run_benchmark(args))
+    print("=" * 70)
+    print("Testing Complete!")
+    print("=" * 70)
+    print(f"Total files: {len(AUDIO_FILES)}")
+    print(f"Newly processed: {newly_processed_count}")
+    print(f"Skipped (already done): {skipped_count}")
+    print(f"Failed: {failed_count}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    main()
-
-nohup python benchmark_maria_nemotron.py --remaining-only --no-download --realtime --segment-seconds 300 --receive-timeout 1200 > nemotron_remaining_full.log 2>&1 &
-
+    asyncio.run(main())
