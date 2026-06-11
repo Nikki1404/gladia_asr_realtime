@@ -1345,6 +1345,3 @@ if __name__ == "__main__":
     main()
 
 
-
-gcloud compute ssh nikita_verma2@cx-asr-test --zone=us-central1-a --project=emr-dgt-autonomous-uctr1-snbx
-gcloud compute scp C:\Users\re_nikitav\Desktop\bu-digital-cx-speech-asr-realtime-custom-vad\scripts\benchmark_maria_nemotron.py nikita_verma2@cx-asr-test:/home/nikita_verma2/ --zone=us-central1-a --project=emr-dgt-autonomous-uctr1-snbx --tunnel-through-iap
