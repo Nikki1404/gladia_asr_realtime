@@ -6,6 +6,7 @@ import time
 import glob
 import re
 import queue
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -484,7 +485,23 @@ def start_deepgram_connection(state, sample_rate, channels):
     connection.on(EventType.CLOSE, on_close)
     connection.on(EventType.ERROR, on_error)
 
-    connection.start_listening()
+    # IMPORTANT:
+    # In this Deepgram SDK version, start_listening() can block while waiting
+    # for messages. If we call it directly here, audio is never sent and
+    # Deepgram closes the socket with NET-0001 timeout.
+    # Run the listener in a background thread, then immediately return so
+    # file/mic streaming can start sending audio.
+    listener_thread = threading.Thread(
+        target=connection.start_listening,
+        name="deepgram-listener",
+        daemon=True,
+    )
+    listener_thread.start()
+    state["_listener_thread"] = listener_thread
+
+    # Give the SDK a very short moment to start the socket listener.
+    # Do not wait too long, otherwise Deepgram may timeout before audio is sent.
+    time.sleep(0.2)
 
     state["connection_time"] = time.time() - connection_start
 
@@ -882,53 +899,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-(azure_test_env) PS C:\Users\re_nikitav\Documents\azure_benchmarking> python .\deepgram_python_sdk.py --mode file --file "C:/Users/re_nikitav/Documents/azure_benchmarking/audio/cartesia_audio.wav" --force
-======================================================================
-Deepgram Nova-3 SDK Streaming - FILE MODE
-======================================================================
-Files found: 1
-Output Directory: deepgram-nova-3
-
-----------------------------------------------------------------------
-Processing [1/1]: C:/Users/re_nikitav/Documents/azure_benchmarking/audio/cartesia_audio.wav
-----------------------------------------------------------------------
-  Audio: 44100Hz, 1ch, 42.24s
-  Deepgram connection opened
-  Deepgram error: received 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001; then sent 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001
-  Deepgram connection closed
-  Connected in 14.103s
-  Sending WAV as realtime-paced stream...
-  File streaming error: received 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001; then sent 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001
-Traceback (most recent call last):
-  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 558, in stream_wav_file
-    connection.send_media(chunk)
-    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^
-  File "C:\Users\re_nikitav\Documents\azure_asr_test\azure_test_env\Lib\site-packages\deepgram\listen\v1\socket_client.py", line 185, in send_media
-    self._send(message)
-    ~~~~~~~~~~^^^^^^^^^
-  File "C:\Users\re_nikitav\Documents\azure_asr_test\azure_test_env\Lib\site-packages\deepgram\listen\v1\socket_client.py", line 228, in _send
-    self._websocket.send(data)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^
-  File "C:\Users\re_nikitav\Documents\azure_asr_test\azure_test_env\Lib\site-packages\websockets\sync\connection.py", line 480, in send
-    with self.send_context():
-         ~~~~~~~~~~~~~~~~~^^
-  File "C:\Program Files\Python313\Lib\contextlib.py", line 141, in __enter__
-    return next(self.gen)
-  File "C:\Users\re_nikitav\Documents\azure_asr_test\azure_test_env\Lib\site-packages\websockets\sync\connection.py", line 1020, in send_context
-    raise self.protocol.close_exc from original_exc
-websockets.exceptions.ConnectionClosedError: received 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001; then sent 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001
-  Total processing time: 14.355s
-
-✗ FAILED: C:/Users/re_nikitav/Documents/azure_benchmarking/audio/cartesia_audio.wav
-
-======================================================================
-File Mode Complete
-======================================================================
-Total files: 1
-Processed: 0
-Skipped: 0
-Failed: 1
-======================================================================
