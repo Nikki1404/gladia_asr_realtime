@@ -856,3 +856,8 @@ if __name__ == "__main__":
 #if sounddevice doesn't work then 
 # sudo apt-get install -y libportaudio2
 #python deepgram_sdk_client.py
+
+
+(azure_test_env) PS C:\Users\re_nikitav\Documents\azure_benchmarking> python .\deepgram_python_sdk.py --mode file C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
+usage: deepgram_python_sdk.py [-h] --mode {file,mic} [--file FILE] [--duration DURATION]
+deepgram_python_sdk.py: error: unrecognized arguments: C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
