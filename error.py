@@ -1,36 +1,24 @@
-Nikita Verma suggest the changes as per the python sdk - 
- 
-https://github.com/deepgram/deepgram-python-sdk?tab=readme-ov-file#installation
-
-
-i was asked to do this ..
-
-similarly i have done numeric handling in this client so could you suggest  the changes as per the python sdk - (https://github.com/deepgram/deepgram-python-sdk?tab=readme-ov-file#installation)
- 
-
-
-this is my client 
-import os
 import json
+import argparse
 import asyncio
-import websockets
 import wave
 import time
 import glob
 import re
+import queue
 from pathlib import Path
 from datetime import datetime
 
-# =====================
+from deepgram import DeepgramClient
+from deepgram.core.events import EventType
+
 # CONFIG
-# =====================
 
-DEEPGRAM_API_KEY = "5c6e335e937a1b8ded48e7ed2fba525f65b03315"
+DEEPGRAM_API_KEY = "deepgram_api_key"
 
-# Audio files to test
-AUDIO_FILES = sorted(glob.glob("audio/car*.wav"))
+if not DEEPGRAM_API_KEY or DEEPGRAM_API_KEY == "your_deepgram_api_key_here":
+    raise ValueError("Please add your Deepgram API key in DEEPGRAM_API_KEY")
 
-# Output directory
 OUTPUT_DIR = "deepgram-nova-3"
 
 DIGIT_WORDS = {
@@ -70,9 +58,7 @@ NON_NUMERIC_FOLLOW_WORDS = {
     "year", "years", "person", "people", "thing", "things", "way"
 }
 
-# =====================
 # NUMERIC NORMALIZATION
-# =====================
 
 def spoken_number_to_int(tokens):
     if not tokens:
@@ -273,12 +259,9 @@ def normalize_numeric_phrases_context_aware(text):
     text = re.sub(r"\s{2,}", " ", text).strip()
     return text
 
-# =====================
 # AUDIO HELPERS
-# =====================
-
 def get_wav_info(audio_path):
-    with wave.open(audio_path, 'rb') as wf:
+    with wave.open(audio_path, "rb") as wf:
         sample_rate = wf.getframerate()
         channels = wf.getnchannels()
         sample_width = wf.getsampwidth()
@@ -286,41 +269,259 @@ def get_wav_info(audio_path):
         duration = frames / sample_rate
 
         return {
-            'sample_rate': sample_rate,
-            'channels': channels,
-            'sample_width': sample_width,
-            'frames': frames,
-            'duration': duration
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "sample_width": sample_width,
+            "frames": frames,
+            "duration": duration,
         }
 
 
-def get_audio_info(audio_path):
-    file_ext = Path(audio_path).suffix.lower()
-
-    if file_ext == '.wav':
-        return get_wav_info(audio_path)
-    else:
-        return {
-            'format': file_ext[1:],
-            'duration': None
-        }
-
-# =====================
-# CORE WEBSOCKET LOGIC
-# =====================
-
-async def send_wav_realtime(ws, audio_path, audio_info, first_chunk_sent_ref):
-    """
-    Sends WAV audio in 'real-time' paced chunks.
-    first_chunk_sent_ref is a one-element list used to store the timestamp of the first chunk.
-    """
+def safe_get_transcript(message):
     try:
-        with open(audio_path, 'rb') as audio_file:
-            # Skip WAV header
+        if getattr(message, "type", None) != "Results":
+            return None
+
+        alternatives = message.channel.alternatives
+        if not alternatives:
+            return None
+
+        raw_transcript = alternatives[0].transcript or ""
+        if not raw_transcript.strip():
+            return None
+
+        confidence = getattr(alternatives[0], "confidence", 0)
+        is_final = getattr(message, "is_final", False)
+        speech_final = getattr(message, "speech_final", False)
+
+        return raw_transcript, confidence, is_final, speech_final
+
+    except Exception:
+        return None
+
+
+def create_result_state(source_name, audio_duration=0):
+    return {
+        "source_name": source_name,
+        "transcripts": [],
+        "latencies": [],
+        "finalized_segments": [],
+        "utterance_buffer": [],
+        "start_time": time.time(),
+        "first_byte_time": None,
+        "first_response_time": None,
+        "first_final_time": None,
+        "first_chunk_sent_time": None,
+        "response_count": 0,
+        "audio_duration": audio_duration,
+        "send_duration": None,
+        "connection_time": None,
+    }
+
+
+def add_transcript_result(state, raw_transcript, confidence, is_final, speech_final):
+    receive_time = time.time()
+
+    if state["first_byte_time"] is None:
+        state["first_byte_time"] = receive_time - state["start_time"]
+
+    state["response_count"] += 1
+    response_count = state["response_count"]
+
+    transcript = normalize_numeric_phrases_context_aware(raw_transcript)
+
+    latency_from_start = receive_time - state["start_time"]
+
+    if state["first_chunk_sent_time"]:
+        latency_from_first_chunk = receive_time - state["first_chunk_sent_time"]
+    else:
+        latency_from_first_chunk = 0
+
+    if state["first_response_time"] is None and transcript:
+        state["first_response_time"] = latency_from_start
+
+    if state["first_final_time"] is None and is_final and transcript:
+        state["first_final_time"] = latency_from_start
+
+    result_info = {
+        "response_num": response_count,
+        "timestamp": latency_from_start,
+        "latency_from_start": latency_from_start,
+        "latency_from_first_chunk": latency_from_first_chunk,
+        "is_final": is_final,
+        "speech_final": speech_final,
+        "raw_transcript": raw_transcript,
+        "transcript": transcript,
+        "confidence": confidence,
+    }
+
+    state["transcripts"].append(result_info)
+
+    state["latencies"].append({
+        "response_num": response_count,
+        "latency_from_start_ms": latency_from_start * 1000,
+        "latency_from_first_chunk_ms": latency_from_first_chunk * 1000,
+        "is_final": is_final,
+        "speech_final": speech_final,
+        "words": len(transcript.split()),
+        "char_count": len(transcript),
+    })
+
+    if is_final and transcript:
+        state["utterance_buffer"].append(transcript)
+
+    if speech_final and state["utterance_buffer"]:
+        state["finalized_segments"].append(" ".join(state["utterance_buffer"]).strip())
+        state["utterance_buffer"].clear()
+
+    status = "FINAL" if is_final else "INTERIM"
+    sf = " [speech_final]" if speech_final else ""
+    preview = transcript[:100] + "..." if len(transcript) > 100 else transcript
+
+    print(f"    [{status}]{sf} Resp {response_count}: {preview}")
+
+
+def finalize_state(state):
+    if state["utterance_buffer"]:
+        state["finalized_segments"].append(" ".join(state["utterance_buffer"]).strip())
+        state["utterance_buffer"].clear()
+
+    total_time = time.time() - state["start_time"]
+
+    return {
+        "source_name": state["source_name"],
+        "transcripts": state["transcripts"],
+        "latencies": state["latencies"],
+        "finalized_segments": state["finalized_segments"],
+        "total_time": total_time,
+        "audio_duration": state["audio_duration"] or 0,
+        "timing_metrics": {
+            "connection_time": state["connection_time"],
+            "send_duration": state["send_duration"],
+            "first_byte_time": state["first_byte_time"],
+            "first_response_time": state["first_response_time"],
+            "first_final_time": state["first_final_time"],
+            "time_to_first_chunk": (
+                state["first_chunk_sent_time"] - state["start_time"]
+                if state["first_chunk_sent_time"]
+                else None
+            ),
+        },
+    }
+
+# DEEPGRAM CONNECTION
+
+def start_deepgram_connection(state, sample_rate, channels):
+    client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
+
+    connection_start = time.time()
+
+    connection = client.listen.v1.connect(
+        model="nova-3",
+        language="multi",
+        punctuate=True,
+        numerals=True,
+        interim_results=True,
+        endpointing="300",
+        utterance_end_ms="1000",
+        no_delay="true",
+        encoding="linear16",
+        sample_rate=str(sample_rate),
+        channels=str(channels),
+    )
+
+    def on_open(_):
+        print("  Deepgram connection opened")
+
+    def on_message(message):
+        parsed = safe_get_transcript(message)
+
+        msg_type = getattr(message, "type", None)
+
+        if msg_type == "UtteranceEnd":
+            if state["utterance_buffer"]:
+                state["finalized_segments"].append(" ".join(state["utterance_buffer"]).strip())
+                state["utterance_buffer"].clear()
+            print("    [EVENT] UtteranceEnd")
+            return
+
+        if msg_type == "SpeechStarted":
+            print("  Speech started")
+            return
+
+        if parsed is None:
+            return
+
+        raw_transcript, confidence, is_final, speech_final = parsed
+        add_transcript_result(
+            state=state,
+            raw_transcript=raw_transcript,
+            confidence=confidence,
+            is_final=is_final,
+            speech_final=speech_final,
+        )
+
+    def on_close(_):
+        print("  Deepgram connection closed")
+
+    def on_error(error):
+        print(f"  Deepgram error: {error}")
+
+    connection.on(EventType.OPEN, on_open)
+    connection.on(EventType.MESSAGE, on_message)
+    connection.on(EventType.CLOSE, on_close)
+    connection.on(EventType.ERROR, on_error)
+
+    connection.start_listening()
+
+    state["connection_time"] = time.time() - connection_start
+
+    return connection
+
+# FILE STREAMING
+
+async def stream_wav_file(audio_path):
+    audio_path = Path(audio_path)
+
+    if not audio_path.exists():
+        print(f"ERROR: File not found: {audio_path}")
+        return None
+
+    if audio_path.suffix.lower() != ".wav":
+        print("ERROR: This streaming file mode expects WAV input")
+        return None
+
+    audio_info = get_wav_info(audio_path)
+
+    print(
+        f"  Audio: {audio_info['sample_rate']}Hz, "
+        f"{audio_info['channels']}ch, "
+        f"{audio_info['duration']:.2f}s"
+    )
+
+    state = create_result_state(
+        source_name=audio_path.stem,
+        audio_duration=audio_info["duration"],
+    )
+
+    connection = start_deepgram_connection(
+        state=state,
+        sample_rate=audio_info["sample_rate"],
+        channels=audio_info["channels"],
+    )
+
+    print(f"  Connected in {state['connection_time']:.3f}s")
+    print("  Sending WAV as realtime-paced stream...")
+
+    send_start = time.time()
+
+    try:
+        with open(audio_path, "rb") as audio_file:
             audio_file.seek(44)
-            bytes_per_sample = audio_info['sample_width']
-            channels = audio_info['channels']
-            sample_rate = audio_info['sample_rate']
+
+            bytes_per_sample = audio_info["sample_width"]
+            channels = audio_info["channels"]
+            sample_rate = audio_info["sample_rate"]
             bytes_per_second = sample_rate * channels * bytes_per_sample
 
             target_chunk_ms = 100
@@ -332,363 +533,326 @@ async def send_wav_realtime(ws, audio_path, audio_info, first_chunk_sent_ref):
                 if not chunk:
                     break
 
-                await ws.send(chunk)
+                connection.send_media(chunk)
 
-                if first_chunk_sent_ref[0] is None:
-                    first_chunk_sent_ref[0] = time.time()
+                if state["first_chunk_sent_time"] is None:
+                    state["first_chunk_sent_time"] = time.time()
 
                 chunk_duration = len(chunk) / bytes_per_second
                 await asyncio.sleep(chunk_duration)
 
-        # After sending all audio, tell Deepgram we're done
-        await ws.send(json.dumps({"type": "CloseStream"}))
+        state["send_duration"] = time.time() - send_start
 
-    except websockets.exceptions.ConnectionClosedError as e:
-        print(f"  Sender: connection closed while sending: {e}")
+        connection.send_finalize()
+        await asyncio.sleep(3)
+        connection.send_close_stream()
+        await asyncio.sleep(1)
+
     except Exception as e:
-        print(f"  Sender error: {e}")
+        print(f"  File streaming error: {e}")
 
+    result = finalize_state(state)
+    print(f"  Total processing time: {result['total_time']:.3f}s")
 
-async def transcribe_audio_websocket(api_key, audio_path):
-    audio_info = get_audio_info(audio_path)
-    file_ext = Path(audio_path).suffix.lower()
+    return result
 
-    if file_ext != '.wav':
-        print("  ✗ This realtime-paced version currently expects WAV input.")
+# MIC STREAMING
+
+async def stream_microphone(duration=None):
+    try:
+        import sounddevice as sd
+    except ImportError:
+        print("ERROR: sounddevice is not installed")
+        print("Install it using: pip install sounddevice")
         return None
 
-    print(f"  Audio: {audio_info['sample_rate']}Hz, {audio_info['channels']}ch, {audio_info['duration']:.2f}s")
+    sample_rate = 16000
+    channels = 1
+    block_ms = 100
+    block_size = int(sample_rate * block_ms / 1000)
 
-    # Start simple & robust; you can re-enable tweaks later
-    params = (
-        "model=nova-3&"
-        "language=multi&"
-        "punctuate=true&"
-        "numerals=true&"
-        "interim_results=true&"
-        "endpointing=300&"
-        "utterance_end_ms=1000&"
-        "no_delay=true&"
-        "encoding=linear16&"
-        f"sample_rate={audio_info['sample_rate']}&"
-        "channels=1"
+    source_name = f"mic_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    state = create_result_state(source_name=source_name, audio_duration=duration or 0)
+
+    connection = start_deepgram_connection(
+        state=state,
+        sample_rate=sample_rate,
+        channels=channels,
     )
 
-    ws_url = f"wss://api.deepgram.com/v1/listen?{params}"
-    headers = {
-        "Authorization": f"Token {api_key}"
-    }
+    print(f"  Connected in {state['connection_time']:.3f}s")
+    print("  Streaming microphone audio...")
+    print("  Press Ctrl+C to stop")
 
-    transcripts = []
-    latencies = []
-    finalized_segments = []
-    utterance_buffer = []
+    audio_queue = queue.Queue()
+    stop_time = time.time() + duration if duration else None
+    send_start = time.time()
 
-    start_time = time.time()
-    audio_duration = audio_info.get('duration')
-
-    first_byte_time = None
-    first_response_time = None
-    first_final_time = None
-    connection_time = None
-    send_duration = None
-    first_chunk_sent_ref = [None]
+    def audio_callback(indata, frames, time_info, status):
+        if status:
+            print(f"  Mic status: {status}")
+        audio_queue.put(bytes(indata))
 
     try:
-        print("  Connecting to Deepgram WebSocket (Nova-3 realtime)...")
-        async with websockets.connect(ws_url, additional_headers=headers) as ws:
-            connection_time = time.time() - start_time
-            print(f"  Connected in {connection_time:.3f}s")
-            print("  Sending audio via paced realtime chunks...")
+        with sd.RawInputStream(
+            samplerate=sample_rate,
+            blocksize=block_size,
+            channels=channels,
+            dtype="int16",
+            callback=audio_callback,
+        ):
+            while True:
+                if stop_time and time.time() >= stop_time:
+                    break
 
-            send_start = time.time()
-
-            async def receiver():
-                nonlocal first_byte_time, first_response_time, first_final_time, audio_duration
-                response_count = 0
                 try:
-                    async for message in ws:
-                        receive_time = time.time()
-                        response = json.loads(message)
-                        msg_type = response.get("type")
+                    chunk = audio_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-                        if first_byte_time is None:
-                            first_byte_time = receive_time - start_time
+                connection.send_media(chunk)
 
-                        if msg_type == "Results":
-                            response_count += 1
+                if state["first_chunk_sent_time"] is None:
+                    state["first_chunk_sent_time"] = time.time()
 
-                            if 'channel' in response:
-                                alternatives = response['channel'].get('alternatives', [])
-                                if alternatives:
-                                    raw_transcript = alternatives[0].get('transcript', '')
-                                    transcript = normalize_numeric_phrases_context_aware(raw_transcript)
-                                    confidence = alternatives[0].get('confidence', 0)
-                                    is_final = response.get('is_final', False)
-                                    speech_final = response.get('speech_final', False)
+                await asyncio.sleep(0)
 
-                                    latency_from_start = receive_time - start_time
-                                    latency_from_send_start = receive_time - send_start
-                                    if first_chunk_sent_ref[0]:
-                                        latency_from_first_chunk = receive_time - first_chunk_sent_ref[0]
-                                    else:
-                                        latency_from_first_chunk = 0
-
-                                    if first_response_time is None and transcript:
-                                        first_response_time = latency_from_start
-                                    if first_final_time is None and is_final and transcript:
-                                        first_final_time = latency_from_start
-
-                                    result_info = {
-                                        'response_num': response_count,
-                                        'timestamp': latency_from_start,
-                                        'latency_from_start': latency_from_start,
-                                        'latency_from_send_start': latency_from_send_start,
-                                        'latency_from_first_chunk': latency_from_first_chunk,
-                                        'is_final': is_final,
-                                        'speech_final': speech_final,
-                                        'raw_transcript': raw_transcript,
-                                        'transcript': transcript,
-                                        'confidence': confidence
-                                    }
-
-                                    if transcript:
-                                        transcripts.append(result_info)
-                                        latencies.append({
-                                            'response_num': response_count,
-                                            'latency_from_start_ms': latency_from_start * 1000,
-                                            'latency_from_send_start_ms': latency_from_send_start * 1000,
-                                            'latency_from_first_chunk_ms': latency_from_first_chunk * 1000,
-                                            'is_final': is_final,
-                                            'speech_final': speech_final,
-                                            'words': len(transcript.split()),
-                                            'char_count': len(transcript)
-                                        })
-
-                                    if is_final and transcript:
-                                        utterance_buffer.append(transcript)
-
-                                    if speech_final and utterance_buffer:
-                                        finalized_segments.append(" ".join(utterance_buffer).strip())
-                                        utterance_buffer.clear()
-
-                                    status = "FINAL" if is_final else "INTERIM"
-                                    sf = " [speech_final]" if speech_final else ""
-                                    preview = transcript[:80] + "..." if len(transcript) > 80 else transcript
-                                    if preview:
-                                        print(f"    [{status}]{sf} Resp {response_count}: {preview}")
-
-                        elif msg_type == "UtteranceEnd":
-                            if utterance_buffer:
-                                finalized_segments.append(" ".join(utterance_buffer).strip())
-                                utterance_buffer.clear()
-                            print("    [EVENT] UtteranceEnd")
-
-                        elif msg_type == "Metadata":
-                            print("  Metadata received")
-                            if audio_duration is None and 'duration' in response:
-                                audio_duration = response['duration']
-
-                        elif msg_type == "SpeechStarted":
-                            print("  Speech started")
-
-                except websockets.exceptions.ConnectionClosedError as e:
-                    print(f"  Receiver: connection closed by server: {e}")
-                except Exception as e:
-                    print(f"  Receiver error: {e}")
-
-            receiver_task = asyncio.create_task(receiver())
-            await send_wav_realtime(ws, audio_path, audio_info, first_chunk_sent_ref)
-            send_end = time.time()
-            send_duration = send_end - send_start
-
-            # Wait a bit for remaining messages, then cancel receiver if still running
-            try:
-                await asyncio.wait_for(receiver_task, timeout=5)
-            except asyncio.TimeoutError:
-                receiver_task.cancel()
+    except KeyboardInterrupt:
+        print("\n  Mic stopped by user")
 
     except Exception as e:
-        print(f"  ✗ WebSocket Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        print(f"  Mic streaming error: {e}")
 
-    if utterance_buffer:
-        finalized_segments.append(" ".join(utterance_buffer).strip())
-        utterance_buffer.clear()
+    finally:
+        state["send_duration"] = time.time() - send_start
 
-    total_time = time.time() - start_time
-    print(f"  Total processing time: {total_time:.3f}s")
+        try:
+            connection.send_finalize()
+            await asyncio.sleep(2)
+            connection.send_close_stream()
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"  Error while closing Deepgram stream: {e}")
 
-    return {
-        'transcripts': transcripts,
-        'latencies': latencies,
-        'finalized_segments': finalized_segments,
-        'total_time': total_time,
-        'audio_duration': audio_duration if audio_duration else 0,
-        'timing_metrics': {
-            'connection_time': connection_time,
-            'send_duration': send_duration,
-            'first_byte_time': first_byte_time,
-            'first_response_time': first_response_time,
-            'first_final_time': first_final_time,
-            'time_to_first_chunk': (first_chunk_sent_ref[0] - start_time) if first_chunk_sent_ref[0] else None
-        }
-    }
+    result = finalize_state(state)
+    print(f"  Total mic processing time: {result['total_time']:.3f}s")
 
-# =====================
+    return result
+
 # SAVE RESULTS
-# =====================
 
-def save_results(audio_path, result, output_dir):
+def save_results(result, output_dir):
     try:
-        os.makedirs(output_dir, exist_ok=True)
-        audio_name = Path(audio_path).stem
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
 
-        transcript_file = os.path.join(output_dir, f"{audio_name}_transcript.txt")
+        source_name = result["source_name"]
 
-        if result.get('finalized_segments'):
-            full_transcript = " ".join(result['finalized_segments']).strip()
+        transcript_file = output_path / f"{source_name}_transcript.txt"
+        latency_file = output_path / f"{source_name}_latencies.json"
+
+        if result.get("finalized_segments"):
+            full_transcript = " ".join(result["finalized_segments"]).strip()
         else:
-            final_transcripts = [t['transcript'] for t in result['transcripts'] if t['is_final']]
-            full_transcript = ' '.join(final_transcripts).strip()
+            final_transcripts = [
+                t["transcript"]
+                for t in result["transcripts"]
+                if t["is_final"]
+            ]
+            full_transcript = " ".join(final_transcripts).strip()
 
-        with open(transcript_file, 'w', encoding='utf-8') as f:
+        with open(transcript_file, "w", encoding="utf-8") as f:
             f.write(full_transcript)
 
-        print(f"  💾 Transcript saved to: {transcript_file}")
-        print(f"     Words: {len(full_transcript.split())}")
+        if result["latencies"]:
+            avg_from_first_chunk = (
+                sum(l["latency_from_first_chunk_ms"] for l in result["latencies"])
+                / len(result["latencies"])
+            )
+            min_from_first_chunk = min(
+                l["latency_from_first_chunk_ms"] for l in result["latencies"]
+            )
+            max_from_first_chunk = max(
+                l["latency_from_first_chunk_ms"] for l in result["latencies"]
+            )
 
-        latency_file = os.path.join(output_dir, f"{audio_name}_latencies.json")
-
-        if result['latencies']:
-            avg_from_send_start = sum(l['latency_from_send_start_ms'] for l in result['latencies']) / len(result['latencies'])
-            min_from_send_start = min(l['latency_from_send_start_ms'] for l in result['latencies'])
-            max_from_send_start = max(l['latency_from_send_start_ms'] for l in result['latencies'])
-
-            avg_from_first_chunk = sum(l['latency_from_first_chunk_ms'] for l in result['latencies']) / len(result['latencies'])
-            min_from_first_chunk = min(l['latency_from_first_chunk_ms'] for l in result['latencies'])
-            max_from_first_chunk = max(l['latency_from_first_chunk_ms'] for l in result['latencies'])
+            avg_from_start = (
+                sum(l["latency_from_start_ms"] for l in result["latencies"])
+                / len(result["latencies"])
+            )
+            min_from_start = min(l["latency_from_start_ms"] for l in result["latencies"])
+            max_from_start = max(l["latency_from_start_ms"] for l in result["latencies"])
         else:
-            avg_from_send_start = min_from_send_start = max_from_send_start = 0
             avg_from_first_chunk = min_from_first_chunk = max_from_first_chunk = 0
+            avg_from_start = min_from_start = max_from_start = 0
 
         latency_data = {
-            'audio_file': audio_path,
-            'audio_duration_sec': result['audio_duration'],
-            'total_processing_time_sec': result['total_time'],
-            'timestamp': datetime.now().isoformat(),
-            'model': 'nova-3',
-            'language': 'multi',
-            'finalized_segments': result.get('finalized_segments', []),
-            'timing_metrics': {
-                'connection_time_sec': result['timing_metrics']['connection_time'],
-                'send_duration_sec': result['timing_metrics']['send_duration'],
-                'first_byte_latency_sec': result['timing_metrics']['first_byte_time'],
-                'first_response_latency_sec': result['timing_metrics']['first_response_time'],
-                'first_final_latency_sec': result['timing_metrics']['first_final_time'],
-                'time_to_first_chunk_sec': result['timing_metrics']['time_to_first_chunk']
+            "source_name": result["source_name"],
+            "audio_duration_sec": result["audio_duration"],
+            "total_processing_time_sec": result["total_time"],
+            "timestamp": datetime.now().isoformat(),
+            "model": "nova-3",
+            "language": "multi",
+            "finalized_segments": result.get("finalized_segments", []),
+            "timing_metrics": {
+                "connection_time_sec": result["timing_metrics"]["connection_time"],
+                "send_duration_sec": result["timing_metrics"]["send_duration"],
+                "first_byte_latency_sec": result["timing_metrics"]["first_byte_time"],
+                "first_response_latency_sec": result["timing_metrics"]["first_response_time"],
+                "first_final_latency_sec": result["timing_metrics"]["first_final_time"],
+                "time_to_first_chunk_sec": result["timing_metrics"]["time_to_first_chunk"],
             },
-            'latencies': result['latencies'],
-            'summary': {
-                'total_responses': len(result['latencies']),
-                'final_responses': sum(1 for l in result['latencies'] if l['is_final']),
-                'speech_final_responses': sum(1 for l in result['latencies'] if l.get('speech_final')),
-                'total_words': sum(l['words'] for l in result['latencies']),
-                'total_characters': sum(l['char_count'] for l in result['latencies']),
-                'avg_latency_from_send_start_ms': avg_from_send_start,
-                'min_latency_from_send_start_ms': min_from_send_start,
-                'max_latency_from_send_start_ms': max_from_send_start,
-                'avg_latency_from_first_chunk_ms': avg_from_first_chunk,
-                'min_latency_from_first_chunk_ms': min_from_first_chunk,
-                'max_latency_from_first_chunk_ms': max_from_first_chunk,
-            }
+            "latencies": result["latencies"],
+            "summary": {
+                "total_responses": len(result["latencies"]),
+                "final_responses": sum(1 for l in result["latencies"] if l["is_final"]),
+                "speech_final_responses": sum(
+                    1 for l in result["latencies"] if l.get("speech_final")
+                ),
+                "total_words": sum(l["words"] for l in result["latencies"]),
+                "total_characters": sum(l["char_count"] for l in result["latencies"]),
+                "avg_latency_from_start_ms": avg_from_start,
+                "min_latency_from_start_ms": min_from_start,
+                "max_latency_from_start_ms": max_from_start,
+                "avg_latency_from_first_chunk_ms": avg_from_first_chunk,
+                "min_latency_from_first_chunk_ms": min_from_first_chunk,
+                "max_latency_from_first_chunk_ms": max_from_first_chunk,
+            },
         }
 
-        with open(latency_file, 'w', encoding='utf-8') as f:
+        with open(latency_file, "w", encoding="utf-8") as f:
             json.dump(latency_data, f, indent=2, ensure_ascii=False)
 
-        print(f"  💾 Latencies saved to: {latency_file}")
-        if result['timing_metrics']['first_byte_time'] is not None:
-            print(f"     First byte: {result['timing_metrics']['first_byte_time']:.3f}s")
-        if result['timing_metrics']['first_response_time']:
-            print(f"     First response: {result['timing_metrics']['first_response_time']:.3f}s")
-        if result['timing_metrics']['first_final_time']:
-            print(f"     First final: {result['timing_metrics']['first_final_time']:.3f}s")
+        print(f"  Transcript saved to: {transcript_file}")
+        print(f"  Latencies saved to: {latency_file}")
+        print(f"  Words: {len(full_transcript.split())}")
 
         return transcript_file, latency_file
 
     except Exception as e:
-        print(f"  ✗ Error saving results: {e}")
+        print(f"  Error saving results: {e}")
         import traceback
         traceback.print_exc()
         return None, None
 
-# =====================
 # MAIN
-# =====================
 
-async def main():
+async def run_file_mode(file_pattern):
+    files = sorted(glob.glob(file_pattern))
+
+    if not files:
+        print(f"No files found for pattern: {file_pattern}")
+        return
+
     print("=" * 70)
-    print("Deepgram Nova-3 ASR Testing (WebSocket Streaming - Realtime)")
+    print("Deepgram Nova-3 SDK Streaming - FILE MODE")
     print("=" * 70)
-    print(f"API Key: {DEEPGRAM_API_KEY[:10]}...")
+    print(f"Files found: {len(files)}")
     print(f"Output Directory: {OUTPUT_DIR}")
-    print(f"Audio Files: {len(AUDIO_FILES)} files found")
-    print(f"Processing Mode: Sequential realtime-paced streaming")
     print()
 
     skipped_count = 0
-    newly_processed_count = 0
+    processed_count = 0
     failed_count = 0
 
-    for idx, audio_file in enumerate(AUDIO_FILES, 1):
+    for idx, audio_file in enumerate(files, 1):
         print("-" * 70)
-        print(f"Processing [{idx}/{len(AUDIO_FILES)}]: {audio_file}")
+        print(f"Processing [{idx}/{len(files)}]: {audio_file}")
         print("-" * 70)
-
-        if not os.path.exists(audio_file):
-            print("ERROR: File not found")
-            failed_count += 1
-            continue
 
         audio_name = Path(audio_file).stem
-        transcript_file = os.path.join(OUTPUT_DIR, f"{audio_name}_transcript.txt")
-        latency_file = os.path.join(OUTPUT_DIR, f"{audio_name}_latencies.json")
+        transcript_file = Path(OUTPUT_DIR) / f"{audio_name}_transcript.txt"
+        latency_file = Path(OUTPUT_DIR) / f"{audio_name}_latencies.json"
 
-        if os.path.exists(transcript_file) and os.path.exists(latency_file):
+        if transcript_file.exists() and latency_file.exists():
             print("✓ SKIPPED - Already processed")
-            print(f"  Found: {transcript_file}")
-            print(f"  Found: {latency_file}")
             skipped_count += 1
-            print()
             continue
 
-        file_size = os.path.getsize(audio_file)
-        print(f"File size: {file_size:,} bytes ({file_size / 1024:.2f} KB)")
+        result = await stream_wav_file(audio_file)
 
-        result = await transcribe_audio_websocket(DEEPGRAM_API_KEY, audio_file)
-
-        if result and result['transcripts']:
-            print(f"\n✓ SUCCESS! Transcription Complete: {audio_file}")
-            save_results(audio_file, result, OUTPUT_DIR)
-            newly_processed_count += 1
+        if result and result["transcripts"]:
+            print(f"\n✓ SUCCESS: {audio_file}")
+            save_results(result, OUTPUT_DIR)
+            processed_count += 1
         else:
-            print(f"\n✗ Failed to get transcription: {audio_file}")
+            print(f"\n✗ FAILED: {audio_file}")
             failed_count += 1
 
         print()
 
     print("=" * 70)
-    print("Testing Complete!")
+    print("File Mode Complete")
     print("=" * 70)
-    print(f"Total files: {len(AUDIO_FILES)}")
-    print(f"Newly processed: {newly_processed_count}")
-    print(f"Skipped (already done): {skipped_count}")
+    print(f"Total files: {len(files)}")
+    print(f"Processed: {processed_count}")
+    print(f"Skipped: {skipped_count}")
     print(f"Failed: {failed_count}")
     print("=" * 70)
 
 
+async def run_mic_mode(duration):
+    print("=" * 70)
+    print("Deepgram Nova-3 SDK Streaming - MIC MODE")
+    print("=" * 70)
+    print(f"Output Directory: {OUTPUT_DIR}")
+    if duration:
+        print(f"Duration: {duration} seconds")
+    else:
+        print("Duration: until Ctrl+C")
+    print()
+
+    result = await stream_microphone(duration=duration)
+
+    if result and result["transcripts"]:
+        print("\n✓ MIC TRANSCRIPTION SUCCESS")
+        save_results(result, OUTPUT_DIR)
+    else:
+        print("\n✗ No mic transcription received")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--mode",
+        choices=["file", "mic"],
+        required=True,
+        help="Use file mode for WAV files or mic mode for microphone streaming",
+    )
+
+    parser.add_argument(
+        "--file",
+        default="audio/car*.wav",
+        help="WAV file path or glob pattern for file mode",
+    )
+
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=None,
+        help="Mic recording duration in seconds. If not passed, runs until Ctrl+C",
+    )
+
+    return parser.parse_args()
+
+
+async def main():
+    args = parse_args()
+
+    if args.mode == "file":
+        await run_file_mode(args.file)
+
+    elif args.mode == "mic":
+        await run_mic_mode(args.duration)
+
+
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+#pip install deepgram-sdk sounddevice
+#if sounddevice doesn't work then 
+# sudo apt-get install -y libportaudio2
+#python deepgram_sdk_client.py
