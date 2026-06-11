@@ -861,3 +861,23 @@ if __name__ == "__main__":
 (azure_test_env) PS C:\Users\re_nikitav\Documents\azure_benchmarking> python .\deepgram_python_sdk.py --mode file C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
 usage: deepgram_python_sdk.py [-h] --mode {file,mic} [--file FILE] [--duration DURATION]
 deepgram_python_sdk.py: error: unrecognized arguments: C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
+
+(azure_test_env) PS C:\Users\re_nikitav\Documents\azure_benchmarking> python .\deepgram_python_sdk.py --mode file --file C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
+======================================================================
+Deepgram Nova-3 SDK Streaming - FILE MODE
+======================================================================
+Files found: 1
+Output Directory: deepgram-nova-3
+
+----------------------------------------------------------------------
+Processing [1/1]: C:\Users\re_nikitav\Documents\azure_benchmarking\audio\cartesia_audio.wav
+----------------------------------------------------------------------
+✓ SKIPPED - Already processed
+======================================================================
+File Mode Complete
+======================================================================
+Total files: 1
+Processed: 0
+Skipped: 1
+Failed: 0
+======================================================================
