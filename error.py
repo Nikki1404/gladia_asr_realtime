@@ -4,6 +4,17 @@ benchmark_maria_nemotron.py
 
 Benchmarks Nemotron 3.5 ASR WebSocket server on maria*.mp3 files from GCS.
 
+Workflow in this fixed version:
+  1. Find audio files in benchmark_workspace/audios/
+  2. If --remaining-only is used, run only audios missing final result:
+       maria*_transcript.txt OR maria*_latencies.json
+  3. Convert each remaining MP3 to one full 16kHz mono PCM16 WAV
+  4. Split the full WAV into 5-minute segments by default
+  5. Transcribe every segment through WebSocket
+  6. Combine all segment transcripts into one paragraph
+  7. Save one maria*_transcript.txt and one maria*_latencies.json per original audio
+  8. Upload result files to gs://cx-asr-test-data/results/nemotron_3.5/
+
 Inputs:
   gs://cx-asr-test-data/audios/maria*.mp3
   gs://cx-asr-test-data/references/maria*_reference.txt
@@ -15,14 +26,25 @@ Outputs per original audio:
 If an audio fails:
   maria*_error.json
 
-Uploads to:
-  gs://cx-asr-test-data/results/nemotron_3.5/
+Recommended run for remaining files only:
+  nohup python benchmark_maria_nemotron.py \
+    --remaining-only \
+    --no-download \
+    --realtime \
+    --segment-seconds 300 \
+    --receive-timeout 1200 \
+    > nemotron_remaining_full.log 2>&1 &
 
-Recommended run:
-  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --segment-seconds 300 --receive-timeout 1200 > nemotron_benchmark_full.log 2>&1 &
-
-Resume without re-downloading:
-  nohup python benchmark_maria_nemotron.py --limit 15 --language auto --realtime --segment-seconds 300 --receive-timeout 1200 --no-download > nemotron_benchmark_resume.log 2>&1 &
+Clean rerun for remaining files only:
+  nohup python benchmark_maria_nemotron.py \
+    --remaining-only \
+    --no-download \
+    --realtime \
+    --segment-seconds 300 \
+    --receive-timeout 1200 \
+    --force-wav \
+    --force-split \
+    > nemotron_remaining_clean.log 2>&1 &
 """
 
 import argparse
@@ -91,12 +113,15 @@ def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
         text=True,
     )
 
+    if result.stdout:
+        print(result.stdout, flush=True)
+
+    if result.stderr:
+        # ffmpeg progress usually comes on stderr; keep it visible in log.
+        print(result.stderr, file=sys.stderr, flush=True)
+
     if check and result.returncode != 0:
-        if result.stdout:
-            print(result.stdout, flush=True)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr, flush=True)
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+        raise RuntimeError(f"Command failed with returncode={result.returncode}: {' '.join(cmd)}")
 
     return result
 
@@ -160,6 +185,65 @@ def natural_key(path: Path):
     ]
 
 
+def get_final_output_paths(audio_path: Path) -> Tuple[Path, Path, Path]:
+    stem = audio_path.stem
+    latency_out = OUT_DIR / f"{stem}_latencies.json"
+    transcript_out = OUT_DIR / f"{stem}_transcript.txt"
+    error_out = OUT_DIR / f"{stem}_error.json"
+    return latency_out, transcript_out, error_out
+
+
+def is_final_result_complete(audio_path: Path) -> bool:
+    latency_out, transcript_out, _ = get_final_output_paths(audio_path)
+    return latency_out.exists() and transcript_out.exists()
+
+
+def get_remaining_audio_files(audio_files: List[Path]) -> List[Path]:
+    """
+    Remaining means:
+    - audio exists in benchmark_workspace/audios/
+    - but final transcript or final latencies file is missing
+    """
+
+    remaining = []
+
+    for audio_path in audio_files:
+        stem = audio_path.stem
+        latency_out, transcript_out, _ = get_final_output_paths(audio_path)
+
+        if transcript_out.exists() and latency_out.exists():
+            print(f"[done] {stem} already has transcript + latencies", flush=True)
+            continue
+
+        missing = []
+        if not transcript_out.exists():
+            missing.append("transcript")
+        if not latency_out.exists():
+            missing.append("latencies")
+
+        print(f"[remaining] {stem} missing: {', '.join(missing)}", flush=True)
+        remaining.append(audio_path)
+
+    return remaining
+
+
+def get_error_audio_stems() -> set:
+    """
+    Returns stems for files that have error JSONs.
+
+    Example:
+      maria31_error.json -> maria31
+    """
+
+    error_files = sorted(OUT_DIR.glob("maria*_error.json"), key=natural_key)
+    stems = set()
+
+    for error_file in error_files:
+        stems.add(error_file.name.replace("_error.json", ""))
+
+    return stems
+
+
 # ---------------------------------------------------------------------
 # Audio helpers
 # ---------------------------------------------------------------------
@@ -186,38 +270,131 @@ def read_wav_pcm16(wav_path: Path) -> Tuple[bytes, float]:
     return audio_i16.tobytes(), audio_duration_sec
 
 
-def split_mp3_to_wav_segments(
+def get_wav_duration_sec(wav_path: Path) -> float:
+    with wave.open(str(wav_path), "rb") as wf:
+        return wf.getnframes() / float(wf.getframerate())
+
+
+def convert_mp3_to_full_wav(
     mp3_path: Path,
+    force_wav: bool = False,
+) -> Path:
+    """
+    Converts original MP3 to one full 16kHz mono PCM16 WAV file.
+
+    Example:
+      maria31.mp3 -> benchmark_workspace/wav_16k/maria31.wav
+
+    A completion marker is written so incomplete WAVs are not reused.
+    """
+
+    WAV_DIR.mkdir(parents=True, exist_ok=True)
+
+    wav_path = WAV_DIR / f"{mp3_path.stem}.wav"
+    done_marker = WAV_DIR / f"{mp3_path.stem}_wav_complete.json"
+
+    if wav_path.exists() and done_marker.exists() and not force_wav:
+        print(f"[info] Using existing completed full WAV: {wav_path}", flush=True)
+        return wav_path
+
+    if wav_path.exists():
+        print(f"[warn] Removing incomplete/old WAV: {wav_path}", flush=True)
+        wav_path.unlink()
+
+    if done_marker.exists():
+        done_marker.unlink()
+
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-stats",
+        "-i",
+        str(mp3_path),
+        "-vn",
+        "-map",
+        "0:a:0",
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-sample_fmt",
+        "s16",
+        str(wav_path),
+    ]
+
+    run_cmd(cmd)
+
+    if not wav_path.exists() or wav_path.stat().st_size == 0:
+        raise RuntimeError(f"Full WAV conversion failed for {mp3_path}")
+
+    duration_sec = get_wav_duration_sec(wav_path)
+
+    done_marker.write_text(
+        json.dumps(
+            {
+                "source_audio": str(mp3_path),
+                "wav_file": str(wav_path),
+                "sample_rate": SAMPLE_RATE,
+                "duration_sec": duration_sec,
+                "created_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        f"[info] Full WAV complete: {wav_path} duration={duration_sec:.2f}s",
+        flush=True,
+    )
+
+    return wav_path
+
+
+def split_wav_to_segments(
+    wav_path: Path,
     segment_seconds: int,
     force_split: bool = False,
 ) -> List[Path]:
     """
-    Split one MP3 into 16kHz mono PCM16 WAV segments.
+    Splits a full WAV into fixed-size WAV segments.
 
-    For any audio duration:
-      5 min audio       -> 1 segment if segment_seconds=300 or 600
-      45 min audio      -> multiple segments
-      2 hr 41 min audio -> many segments
+    Example:
+      maria31.wav
+        -> maria31_part_0000.wav
+        -> maria31_part_0001.wav
+        -> ...
 
-    All segments are later transcribed and combined into one final transcript.
+    A completion marker is written so incomplete segment folders are not reused.
     """
 
-    per_audio_segment_dir = SEGMENT_DIR / mp3_path.stem
+    per_audio_segment_dir = SEGMENT_DIR / wav_path.stem
     per_audio_segment_dir.mkdir(parents=True, exist_ok=True)
 
-    pattern = per_audio_segment_dir / f"{mp3_path.stem}_part_%04d.wav"
+    done_marker = per_audio_segment_dir / "_split_complete.json"
+    pattern = per_audio_segment_dir / f"{wav_path.stem}_part_%04d.wav"
 
     existing_segments = sorted(
-        per_audio_segment_dir.glob(f"{mp3_path.stem}_part_*.wav"),
+        per_audio_segment_dir.glob(f"{wav_path.stem}_part_*.wav"),
         key=natural_key,
     )
 
-    if existing_segments and not force_split:
+    if existing_segments and done_marker.exists() and not force_split:
         print(
-            f"[info] Using existing {len(existing_segments)} segments for {mp3_path.name}",
+            f"[info] Using existing completed segments for {wav_path.stem}: {len(existing_segments)}",
             flush=True,
         )
         return existing_segments
+
+    if existing_segments and not done_marker.exists():
+        print(
+            f"[warn] Incomplete segments found for {wav_path.stem}. Deleting and recreating.",
+            flush=True,
+        )
 
     for old_file in existing_segments:
         try:
@@ -225,35 +402,68 @@ def split_mp3_to_wav_segments(
         except FileNotFoundError:
             pass
 
+    if done_marker.exists():
+        done_marker.unlink()
+
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-y",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-stats",
         "-i",
-        str(mp3_path),
-        "-ac",
-        "1",
-        "-ar",
-        str(SAMPLE_RATE),
-        "-sample_fmt",
-        "s16",
+        str(wav_path),
         "-f",
         "segment",
         "-segment_time",
         str(segment_seconds),
         "-reset_timestamps",
         "1",
+        "-c",
+        "copy",
         str(pattern),
     ]
 
     run_cmd(cmd)
 
     segment_paths = sorted(
-        per_audio_segment_dir.glob(f"{mp3_path.stem}_part_*.wav"),
+        per_audio_segment_dir.glob(f"{wav_path.stem}_part_*.wav"),
         key=natural_key,
     )
 
     if not segment_paths:
-        raise RuntimeError(f"No segments created for {mp3_path}")
+        raise RuntimeError(f"No segments created for {wav_path}")
+
+    total_duration_sec = get_wav_duration_sec(wav_path)
+    segment_durations = []
+
+    for segment_path in segment_paths:
+        try:
+            segment_durations.append(get_wav_duration_sec(segment_path))
+        except Exception:
+            segment_durations.append(None)
+
+    done_marker.write_text(
+        json.dumps(
+            {
+                "wav_file": str(wav_path),
+                "segment_seconds": segment_seconds,
+                "segment_count": len(segment_paths),
+                "total_duration_sec": total_duration_sec,
+                "segment_durations_sec": segment_durations,
+                "created_at": datetime.now().isoformat(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        f"[info] Segmenting complete for {wav_path.name}: {len(segment_paths)} segments",
+        flush=True,
+    )
 
     return segment_paths
 
@@ -381,7 +591,6 @@ async def benchmark_one_segment(
 
     connection_start = time.time()
 
-    # Disable client ping timeout so long ASR processing does not kill connection.
     async with websockets.connect(
         url,
         ping_interval=None,
@@ -468,7 +677,6 @@ async def benchmark_one_segment(
                                 "server_t_start": t_start,
                             }
                         )
-
                         continue
 
                     if ev_type not in {"partial", "final"}:
@@ -561,8 +769,6 @@ async def benchmark_one_segment(
 
         await ws.send(json.dumps({"type": "eof"}))
 
-        # Dynamic timeout:
-        # For 5-10 min segment, wait enough for EOF flush.
         dynamic_timeout = max(receive_timeout_sec, audio_duration_sec + 600)
 
         try:
@@ -721,7 +927,6 @@ async def benchmark_segmented_audio(
             }
         )
 
-    # Match your reference format: one continuous paragraph.
     transcript = " ".join(x.strip() for x in all_transcript_parts if x.strip())
     transcript = re.sub(r"\s+", " ", transcript).strip()
 
@@ -824,13 +1029,35 @@ async def run_benchmark(args):
 
     audio_files = sorted(AUDIO_DIR.glob("maria*.mp3"), key=natural_key)
 
+    if args.only_file:
+        wanted = args.only_file.replace(".mp3", "").strip()
+        audio_files = [p for p in audio_files if p.stem == wanted]
+        if not audio_files:
+            raise RuntimeError(f"No audio found for --only-file {wanted}")
+        print(f"[info] Running only file: {wanted}", flush=True)
+
+    if args.only_errors:
+        error_stems = get_error_audio_stems()
+        if not error_stems:
+            print("[info] No maria*_error.json files found. Nothing to rerun.", flush=True)
+            return
+
+        print(f"[info] Re-running only failed files: {sorted(error_stems)}", flush=True)
+        audio_files = [audio_path for audio_path in audio_files if audio_path.stem in error_stems]
+
+    if args.remaining_only:
+        audio_files = get_remaining_audio_files(audio_files)
+        if not audio_files:
+            print("[info] No remaining files found. Everything is completed.", flush=True)
+            return
+
     if args.limit:
         audio_files = audio_files[: args.limit]
 
     if not audio_files:
         raise RuntimeError(f"No maria*.mp3 files found in {AUDIO_DIR}")
 
-    print(f"\nFound {len(audio_files)} maria audio files.", flush=True)
+    print(f"\nFound {len(audio_files)} maria audio files to run.", flush=True)
 
     completed = 0
     failed = 0
@@ -848,30 +1075,27 @@ async def run_benchmark(args):
         else:
             print(f"[warn] No reference found for {audio_path.name}", flush=True)
 
-        output_prefix = audio_path.stem
+        latency_out, transcript_out, error_out = get_final_output_paths(audio_path)
 
-        latency_out = OUT_DIR / f"{output_prefix}_latencies.json"
-        transcript_out = OUT_DIR / f"{output_prefix}_transcript.txt"
-        error_out = OUT_DIR / f"{output_prefix}_error.json"
-
-        if latency_out.exists() and transcript_out.exists() and not args.force:
-            print(f"[skip] Existing output found for {output_prefix}, skipping.", flush=True)
+        if is_final_result_complete(audio_path) and not args.force and not args.remaining_only and not args.only_errors:
+            print(f"[skip] Existing output found for {audio_path.stem}, skipping.", flush=True)
             skipped += 1
 
             if args.upload_each:
                 try:
                     gcs_upload_files([latency_out, transcript_out], RESULT_GCS)
                 except Exception as upload_error:
-                    print(
-                        f"[warn] Could not upload skipped existing files: {upload_error}",
-                        flush=True,
-                    )
-
+                    print(f"[warn] Could not upload skipped existing files: {upload_error}", flush=True)
             continue
 
         try:
-            segment_paths = split_mp3_to_wav_segments(
+            full_wav_path = convert_mp3_to_full_wav(
                 mp3_path=audio_path,
+                force_wav=args.force_wav,
+            )
+
+            segment_paths = split_wav_to_segments(
+                wav_path=full_wav_path,
                 segment_seconds=args.segment_seconds,
                 force_split=args.force_split,
             )
@@ -925,10 +1149,17 @@ async def run_benchmark(args):
             print(f"Saved: {latency_out}", flush=True)
             print(f"Saved: {transcript_out}", flush=True)
 
+            if error_out.exists():
+                try:
+                    error_out.unlink()
+                    print(f"[info] Removed old error file: {error_out}", flush=True)
+                except Exception as remove_error:
+                    print(f"[warn] Could not remove old error file: {remove_error}", flush=True)
+
             completed += 1
 
             if args.upload_each:
-                print(f"Uploading result files for {output_prefix} to GCS...", flush=True)
+                print(f"Uploading result files for {audio_path.stem} to GCS...", flush=True)
                 gcs_upload_files([latency_out, transcript_out], RESULT_GCS)
 
         except Exception as e:
@@ -995,15 +1226,15 @@ def main():
     parser.add_argument(
         "--limit",
         type=int,
-        default=15,
-        help="Number of maria*.mp3 files to benchmark. Default: 15",
+        default=None,
+        help="Optional number of maria*.mp3 files to benchmark. Default: all selected files.",
     )
 
     parser.add_argument(
         "--segment-seconds",
         type=int,
         default=300,
-        help="Split audio into N-second chunks. Default: 300 seconds.",
+        help="Split full WAV into N-second chunks. Default: 300 seconds.",
     )
 
     parser.add_argument(
@@ -1071,13 +1302,38 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-run even if output files already exist.",
+        help="Re-run even if final output files already exist.",
+    )
+
+    parser.add_argument(
+        "--force-wav",
+        action="store_true",
+        help="Recreate full WAV even if WAV completion marker exists.",
     )
 
     parser.add_argument(
         "--force-split",
         action="store_true",
-        help="Recreate WAV segments even if segment files already exist.",
+        help="Recreate WAV segments even if split completion marker exists.",
+    )
+
+    parser.add_argument(
+        "--remaining-only",
+        action="store_true",
+        help="Run only audios that do not have final transcript + latencies result.",
+    )
+
+    parser.add_argument(
+        "--only-errors",
+        action="store_true",
+        help="Run only audios that have maria*_error.json in the result folder.",
+    )
+
+    parser.add_argument(
+        "--only-file",
+        type=str,
+        default=None,
+        help="Run only one audio stem, for example maria31 or maria31.mp3.",
     )
 
     args = parser.parse_args()
@@ -1087,44 +1343,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-================================================================================
-[14/15] Benchmarking: maria31.mp3
-================================================================================
-Reference: maria31_reference.txt
-[cmd] ffmpeg -y -i benchmark_workspace/audios/maria31.mp3 -ac 1 -ar 16000 -sample_fmt s16 -f segment -segment_time 300 -reset_timestamps 1 benchmark_workspace/segments_16k/maria31/maria31_part_%04d.wav
-ffmpeg version 5.1.9-0+deb12u1 Copyright (c) 2000-2026 the FFmpeg developers
-  built with gcc 12 (Debian 12.2.0-14+deb12u1)
-  configuration: --prefix=/usr --extra-version=0+deb12u1 --toolchain=hardened --libdir=/usr/lib/x86_64-linux-gnu --incdir=/usr/include/x86_64-linux-gnu --arch=amd64 --enable-gpl --disable-stripping --enable-gnutls --enable-ladspa --enable-libaom --enable-libass --enable-libbluray --enable-libbs2b --enable-libcaca --enable-libcdio --enable-libcodec2 --enable-libdav1d --enable-libflite --enable-libfontconfig --enable-libfreetype --enable-libfribidi --enable-libglslang --enable-libgme --enable-libgsm --enable-libjack --enable-libmp3lame --enable-libmysofa --enable-libopenjpeg --enable-libopenmpt --enable-libopus --enable-libpulse --enable-librabbitmq --enable-librist --enable-librubberband --enable-libshine --enable-libsnappy --enable-libsoxr --enable-libspeex --enable-libsrt --enable-libssh --enable-libsvtav1 --enable-libtheora --enable-libtwolame --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx265 --enable-libxml2 --enable-libxvid --enable-libzimg --enable-libzmq --enable-libzvbi --enable-lv2 --enable-omx --enable-openal --enable-opencl --enable-opengl --enable-sdl2 --disable-sndio --enable-libjxl --enable-pocketsphinx --enable-librsvg --enable-libmfx --enable-libdc1394 --enable-libdrm --enable-libiec61883 --enable-chromaprint --enable-frei0r --enable-libx264 --enable-libplacebo --enable-librav1e --enable-shared
-  libavutil      57. 28.100 / 57. 28.100
-  libavcodec     59. 37.100 / 59. 37.100
-  libavformat    59. 27.100 / 59. 27.100
-  libavdevice    59.  7.100 / 59.  7.100
-  libavfilter     8. 44.100 /  8. 44.100
-  libswscale      6.  7.100 /  6.  7.100
-  libswresample   4.  7.100 /  4.  7.100
-  libpostproc    56.  6.100 / 56.  6.100
-[mp3 @ 0x55ab597a8940] Estimating duration from bitrate, this may be inaccurate
-Input #0, mp3, from 'benchmark_workspace/audios/maria31.mp3':
-  Duration: 01:45:40.94, start: 0.000000, bitrate: 128 kb/s
-  Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 128 kb/s
-Stream mapping:
-  Stream #0:0 -> #0:0 (mp3 (mp3float) -> pcm_s16le (native))
-Press [q] to stop, [?] for help
-[segment @ 0x55ab597acb80] Opening 'benchmark_workspace/segments_16k/maria31/maria31_part_0000.wav' for writing
-Output #0, segment, to 'benchmark_workspace/segments_16k/maria31/maria31_part_%04d.wav':
-  Metadata:
-    encoder         : Lavf59.27.100
-  Stream #0:0: Audio: pcm_s16le, 16000 Hz, mono, s16, 256 kb/s
-    Metadata:
-      encoder         : Lavc59.37.100 pcm_s16le
-size=N/A time=00:00:00.02 bitrate=N/A speed=N/A    
-size=N/A time=00:04:43.74 bitrate=N/A speed= 567x    
-[segment @ 0x55ab597acb80] Opening 'benchmark_workspace/segments_16k/maria31/maria31_part_0001.wav' for writing
-size=N/A time=00:09:29.12 bitrate=N/A speed= 569x    
-[segment @ 0x55ab597acb80] Opening 'benchmark_workspace/segments_16k/maria31/maria31_part_0002.wav' for writing
-size=N/A time=00:14:28.75 bitrate=N/A speed= 579x    
-[segment @ 0x55ab597acb80] Opening 'benchmark_workspace/segments_16k/maria31/maria31_part_0003.wav' for writing
-size=N/A time=00:19:08.94 bitrate=N/A speed= 574x
