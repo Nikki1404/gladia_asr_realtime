@@ -419,19 +419,28 @@ def start_deepgram_connection(state, sample_rate, channels):
 
     connection_start = time.time()
 
-    connection = client.listen.v1.connect(
+    # Deepgram SDK v6 listen.v1.connect returns a context manager.
+    # Older SDK variants may return the connection directly.
+    # This compatibility block supports both, and avoids passing unsupported args like no_delay.
+    connection_obj = client.listen.v1.connect(
         model="nova-3",
         language="multi",
         punctuate=True,
         numerals=True,
         interim_results=True,
-        endpointing="300",
-        utterance_end_ms="1000",
-        no_delay="true",
+        endpointing=300,
+        utterance_end_ms=1000,
         encoding="linear16",
-        sample_rate=str(sample_rate),
-        channels=str(channels),
+        sample_rate=sample_rate,
+        channels=channels,
     )
+
+    if hasattr(connection_obj, "__enter__"):
+        connection = connection_obj.__enter__()
+        state["_connection_context"] = connection_obj
+    else:
+        connection = connection_obj
+        state["_connection_context"] = None
 
     def on_open(_):
         print("  Deepgram connection opened")
@@ -480,6 +489,16 @@ def start_deepgram_connection(state, sample_rate, channels):
     state["connection_time"] = time.time() - connection_start
 
     return connection
+
+
+def close_deepgram_context(state):
+    """Close SDK context manager if this SDK version uses one."""
+    ctx = state.get("_connection_context")
+    if ctx is not None and hasattr(ctx, "__exit__"):
+        try:
+            ctx.__exit__(None, None, None)
+        except Exception as e:
+            print(f"  Warning: error closing Deepgram SDK context: {e}")
 
 # FILE STREAMING
 
@@ -550,6 +569,7 @@ async def stream_wav_file(audio_path):
         await asyncio.sleep(3)
         connection.send_close_stream()
         await asyncio.sleep(1)
+        close_deepgram_context(state)
 
     except Exception as e:
         print(f"  File streaming error: {e}")
@@ -636,6 +656,7 @@ async def stream_microphone(duration=None):
             await asyncio.sleep(2)
             connection.send_close_stream()
             await asyncio.sleep(1)
+            close_deepgram_context(state)
         except Exception as e:
             print(f"  Error while closing Deepgram stream: {e}")
 
@@ -861,53 +882,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-(azure_test_env) PS C:\Users\re_nikitav\Documents\azure_benchmarking> python .\deepgram_python_sdk.py --mode file --file "C:/Users/re_nikitav/Documents/azure_benchmarking/audio/cartesia_audio.wav" --force
-======================================================================
-Deepgram Nova-3 SDK Streaming - FILE MODE
-======================================================================
-Files found: 1
-Output Directory: deepgram-nova-3
-
-----------------------------------------------------------------------
-Processing [1/1]: C:/Users/re_nikitav/Documents/azure_benchmarking/audio/cartesia_audio.wav
-----------------------------------------------------------------------
-  Audio: 44100Hz, 1ch, 42.24s
-Traceback (most recent call last):
-  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 863, in <module>
-    asyncio.run(main())
-    ~~~~~~~~~~~^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
-    return runner.run(main)
-           ~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
-    return future.result()
-           ~~~~~~~~~~~~~^^
-  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 856, in main
-    await run_file_mode(args.file, force=args.force)
-  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 778, in run_file_mode
-    result = await stream_wav_file(audio_file)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 510, in stream_wav_file
-    connection = start_deepgram_connection(
-        state=state,
-        sample_rate=audio_info["sample_rate"],
-        channels=audio_info["channels"],
-    )
-  File "C:\Users\re_nikitav\Documents\azure_benchmarking\deepgram_python_sdk.py", line 422, in start_deepgram_connection
-    connection = client.listen.v1.connect(
-        model="nova-3",
-    ...<9 lines>...
-        channels=str(channels),
-    )
-  File "C:\Program Files\Python313\Lib\contextlib.py", line 305, in helper
-    return _GeneratorContextManager(func, args, kwds)
-  File "C:\Program Files\Python313\Lib\contextlib.py", line 109, in __init__
-    self.gen = func(*args, **kwds)
-               ~~~~^^^^^^^^^^^^^^^
-TypeError: V1Client.connect() got an unexpected keyword argument 'no_delay'
