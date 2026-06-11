@@ -1345,12 +1345,24 @@ if __name__ == "__main__":
     main()
 
 
-nikita_verma2@cx-asr-test:~$ df -h
-Filesystem       Size  Used Avail Use% Mounted on
-udev             7.9G     0  7.9G   0% /dev
-tmpfs            1.6G  784K  1.6G   1% /run
-/dev/nvme0n1p1    99G   99G     0 100% /
-tmpfs            7.9G     0  7.9G   0% /dev/shm
-tmpfs            5.0M     0  5.0M   0% /run/lock
-/dev/nvme0n1p15  124M   12M  113M  10% /boot/efi
-tmpfs            1.6G     0  1.6G   0% /run/user/1016
+nikita_verma2@cx-asr-test:~$ du -sh /* 2>/dev/null | sort -rh | head -20
+7.0G    /home
+4.2G    /usr
+599M    /var
+435M    /opt
+81M     /boot
+5.1M    /etc
+644K    /run
+20K     /tmp
+16K     /lost+found
+4.0K    /srv
+4.0K    /root
+4.0K    /mnt
+4.0K    /media
+0       /sys
+0       /sbin
+0       /proc
+0       /lib64
+0       /lib
+0       /dev
+0       /bin
