@@ -373,20 +373,13 @@ if __name__ == "__main__":
 
 
 
-Hi ⁠
+Hi Ashutosh,
 
-Ashutosh
+I connected with Sumeet Tiwari regarding numeric handling for Deepgram. Deepgram is providing the transcription properly without missing the spoken content, but the challenge is around converting different spoken number formats into the expected numeric output.
 
- 
+We discussed two possible approaches:
 
-Sidana
+Rule-based post-processing: Define handling for different ways users may speak numbers and convert them into numeric values. For example, “twenty thirty four” → 2034, “twelve forty three” → 1243, “double five” → 55, etc.
+LLM-based normalization: Take the ASR output as-is from Deepgram and pass it to an LLM with few-shot prompting, where we define examples for multiple number-speaking formats and let the LLM convert them into the required numeric format.
 
-,
-
-I have connected with Sumeet Tiwari regarding Numeric handling for deepgram as deepgram is giving proper transcription without loosing anything .
-
-So we reached to two conclusions -
-
-1- we define rule for every manner user speak to convert that to word to numbers.
-
-2. we can take input as it is from asr and then pass it to LLM and via (few shot prompting by defining prompts for multiple formats) and then get the numbers converted 
+Could you please suggest which approach we should go with? Rule-based handling may be faster and more controlled, but LLM-based normalization may cover more speech variations with less manual rule maintenance.
