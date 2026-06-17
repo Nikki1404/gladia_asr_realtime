@@ -373,21 +373,23 @@ if __name__ == "__main__":
 
 
 
-Hi Ashutosh,
-
-We need your suggestion on the approach to be followed for numeric handling in the Deepgram ASR flow.
+Need your suggestion on the approach to be followed for numeric handling in the Deepgram ASR flow.
 
 Currently, Deepgram is providing the transcription correctly, but the challenge is around converting different spoken number formats into the expected numeric output.
 
-We are considering the below two options:
+Below are the two possible options:
 
-1. **Rule-based post-processing:**
-   Define handling for different ways users may speak numbers and convert them into numeric values. For example, “twenty thirty four” → 2034, “twelve forty three” → 1243, “double five” → 55, “one hundred two and three” → 1023, etc.
+Rule-based post-processing:
+Define handling for different ways users may speak numbers and convert them into numeric values. For example, “twenty thirty four” → 2034, “twelve forty three” → 1243, “double five” → 55, “one hundred two and three” → 1023, etc.
 
-2. **LLM-based normalization:**
-   Take the ASR output as-is from Deepgram and pass it to an LLM with few-shot prompting. We can define examples for multiple number-speaking formats and let the LLM convert them into the required numeric format.
+Limitation: This approach is faster and more controlled, but rules need to be defined for every possible speaking pattern. It may become difficult to maintain if users speak numbers in many different formats.
 
-Could you please suggest which approach we should go with? Rule-based handling may be faster and more controlled, while LLM-based normalization may cover more speech variations with less manual rule maintenance.
+LLM-based normalization:
+Take the ASR output as-is from Deepgram and pass it to an LLM with few-shot prompting. Examples can be defined for multiple number-speaking formats, and the LLM can convert them into the required numeric format.
+
+Limitation: This approach may cover more speech variations with less manual rule maintenance, but it can add latency and cost. Output consistency also needs to be validated carefully.
+
+Could you please suggest which approach should be followed?
 
 Regards,
 Nikita
