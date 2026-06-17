@@ -370,3 +370,23 @@ if __name__ == "__main__":
 
     for text in tests:
         print(text, "=>", normalize_numeric_phrases_context_aware(text))
+
+
+
+Hi ⁠
+
+Ashutosh
+
+ 
+
+Sidana
+
+,
+
+I have connected with Sumeet Tiwari regarding Numeric handling for deepgram as deepgram is giving proper transcription without loosing anything .
+
+So we reached to two conclusions -
+
+1- we define rule for every manner user speak to convert that to word to numbers.
+
+2. we can take input as it is from asr and then pass it to LLM and via (few shot prompting by defining prompts for multiple formats) and then get the numbers converted 
